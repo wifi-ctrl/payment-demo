@@ -3,7 +3,6 @@ package http
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
 
 	"payment-demo/internal/catalog/application"
 	"payment-demo/internal/catalog/domain/model"
@@ -19,8 +18,7 @@ func NewCatalogHandler(uc *application.CatalogUseCase) *CatalogHandler {
 }
 
 func (h *CatalogHandler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/products", h.handleListProducts)
-	mux.HandleFunc("/products/", h.handleGetProduct)
+	mux.HandleFunc("/products", h.handleProducts)
 }
 
 type ProductResponse struct {
@@ -31,11 +29,23 @@ type ProductResponse struct {
 	Status   string `json:"status"`
 }
 
-func (h *CatalogHandler) handleListProducts(w http.ResponseWriter, r *http.Request) {
+func (h *CatalogHandler) handleProducts(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	id := r.URL.Query().Get("id")
+	if id != "" {
+		product, err := h.useCase.GetProduct(r.Context(), model.ProductID(id))
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		jsonOK(w, toProductResponse(product))
+		return
+	}
+
 	products, err := h.useCase.ListProducts(r.Context())
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
@@ -46,20 +56,6 @@ func (h *CatalogHandler) handleListProducts(w http.ResponseWriter, r *http.Reque
 		resp = append(resp, toProductResponse(p))
 	}
 	jsonOK(w, resp)
-}
-
-func (h *CatalogHandler) handleGetProduct(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	id := strings.TrimPrefix(r.URL.Path, "/products/")
-	product, err := h.useCase.GetProduct(r.Context(), model.ProductID(id))
-	if err != nil {
-		jsonError(w, err.Error(), http.StatusNotFound)
-		return
-	}
-	jsonOK(w, toProductResponse(product))
 }
 
 func toProductResponse(p *model.Product) ProductResponse {

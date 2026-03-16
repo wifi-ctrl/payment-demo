@@ -15,19 +15,25 @@ import (
 	catalogHTTP "payment-demo/internal/catalog/handler/http"
 
 	// ── Card Context ──
-	// cardRepo 同时被 card usecase 和 payment 侧 ACL adapter 持有
-	// 跨上下文共享 Repository 指针只允许在 main.go（Composition Root）进行
 	cardPersistence "payment-demo/internal/card/adapter/persistence"
 	cardVault "payment-demo/internal/card/adapter/vault"
 	cardApp "payment-demo/internal/card/application"
 	cardHTTP "payment-demo/internal/card/handler/http"
 
+	// ── Merchant Context ──
+	// merchantRepo 同时被 merchant usecase 和 payment 侧 ACL adapter 持有
+	// 跨上下文共享 Repository 指针只允许在 main.go（Composition Root）进行
+	merchantPersistence "payment-demo/internal/merchant/adapter/persistence"
+	merchantApp "payment-demo/internal/merchant/application"
+	merchantHTTP "payment-demo/internal/merchant/handler/http"
+
 	// ── Payment Context ──
-	// paymentCard / paymentCatalog 均为 ACL adapter，
+	// paymentCard / paymentCatalog / paymentMerchant 均为 ACL adapter，
 	// 实现 payment 侧消费方定义的 port 接口，隔离跨上下文依赖
 	paymentCard "payment-demo/internal/payment/adapter/card"
 	paymentCatalog "payment-demo/internal/payment/adapter/catalog"
 	paymentGateway "payment-demo/internal/payment/adapter/gateway"
+	paymentMerchant "payment-demo/internal/payment/adapter/merchant"
 	paymentPersistence "payment-demo/internal/payment/adapter/persistence"
 	paymentApp "payment-demo/internal/payment/application"
 	paymentHTTP "payment-demo/internal/payment/handler/http"
@@ -46,49 +52,55 @@ func main() {
 	// ========================================
 
 	// ── Identity Context ──
-	// userRepo / sessionRepo 仅在 identity 内部使用
 	userRepo := identityPersistence.NewInMemoryUserRepository()
 	sessionRepo := identityPersistence.NewInMemorySessionRepository()
 	authUseCase := identityApp.NewAuthUseCase(userRepo, sessionRepo)
-	// AuthMiddleware 由 identity 提供，保护全局路由；
-	// 写入 ctx 的 UserID 由其他上下文的 handler 通过 middleware.UserIDFromContext 读取
+	// AuthMiddleware 由 identity 提供，写入 ctx 的 UserID 由其他上下文 handler 读取
 	authMiddleware := identityMW.NewAuthMiddleware(authUseCase)
 
 	// ── Catalog Context ──
-	// productRepo 同时被 catalogUseCase 和 paymentCatalog ACL adapter 使用
 	productRepo := catalogPersistence.NewInMemoryProductRepository()
 	catalogUseCase := catalogApp.NewCatalogUseCase(productRepo)
 	catalogHandler := catalogHTTP.NewCatalogHandler(catalogUseCase)
 
 	// ── Card Context ──
 	// cardRepo 在此处共享给 payment 侧的 ACL adapter（CardAdapter）
-	// 这是唯一合法的跨上下文共享点；card/domain 和 payment/domain 互不可见
 	cardRepo := cardPersistence.NewInMemoryCardRepository()
 	fakeVault := cardVault.NewFakeCardVault()
 	cardUseCase := cardApp.NewCardUseCase(cardRepo, fakeVault)
 	cardHandler := cardHTTP.NewCardHandler(cardUseCase)
 
+	// ── Merchant Context ──
+	// merchantRepo 共享给 payment 侧的 MerchantAdapter（ACL），合法的跨上下文依赖注入点
+	merchantRepo := merchantPersistence.NewInMemoryMerchantRepository()
+	merchantUseCase := merchantApp.NewMerchantUseCase(merchantRepo)
+	merchantHandler := merchantHTTP.NewMerchantHandler(merchantUseCase)
+
 	// ── Payment Context ──
 	// CatalogAdapter: ACL — 实现 payment 的 CatalogQuery 端口
-	//   接收 catalog.ProductRepository，翻译为 payment 视角的 ProductView
 	catalogAdapter := paymentCatalog.NewCatalogAdapter(productRepo)
 	// CardAdapter: ACL — 实现 payment 的 CardQuery 端口
-	//   接收 card.CardRepository（通过 cardPort.CardRepository 接口），
-	//   翻译为 payment 视角的 SavedCardView（含 VaultToken）
 	cardAdapter := paymentCard.NewCardAdapter(cardRepo)
-	gateway := paymentGateway.NewMockPaymentGateway()
+	// MerchantAdapter: ACL — 实现 payment 的 MerchantQuery 端口（多商户路由核心）
+	// 跨上下文 import 仅在此 adapter 包，符合架构约束
+	merchantAdapter := paymentMerchant.NewMerchantAdapter(merchantRepo)
+	// GatewayFactory: 根据商户凭据动态构建 Card/PayPal Gateway 实例（多商户隔离）
+	gatewayFactory := paymentGateway.NewMockGatewayFactory()
 	txnRepo := paymentPersistence.NewInMemoryTransactionRepository()
-	chargeUseCase := paymentApp.NewChargeUseCase(gateway, txnRepo, catalogAdapter, cardAdapter)
+
+	// NewChargeUseCase 注入 MerchantQuery（多商户路由）+ GatewayFactory（动态 Gateway 构建）
+	// 替代原有静态注入 gateway + paypalGateway，实现商户级别的支付渠道隔离
+	chargeUseCase := paymentApp.NewChargeUseCase(merchantAdapter, gatewayFactory, txnRepo, catalogAdapter, cardAdapter)
 	paymentHandler := paymentHTTP.NewPaymentHandler(chargeUseCase)
 
 	// ── 路由组装 ──
 	mux := http.NewServeMux()
-	catalogHandler.RegisterRoutes(mux) // GET /products, GET /products/{id}
-	cardHandler.RegisterRoutes(mux)    // POST /cards, GET /cards, GET/DELETE /cards/{id}, 子路由见下
-	paymentHandler.RegisterRoutes(mux) // POST /charge, POST /capture/{id}, POST /refund/{id}, GET /transaction/{id}
+	catalogHandler.RegisterRoutes(mux)  // GET /products, GET /products/{id}
+	cardHandler.RegisterRoutes(mux)     // POST /cards, GET /cards, GET/DELETE /cards/{id}, 子路由
+	merchantHandler.RegisterRoutes(mux) // POST/GET /merchants, 子路由 /credentials /suspend
+	paymentHandler.RegisterRoutes(mux)  // POST /charge, POST /charge/paypal, POST /capture/{id}, POST /refund/{id}, GET /transaction/{id}
 
 	// ── 中间件链 ──
-	// Auth Middleware 包裹整个 mux，所有请求均需携带 Authorization: Bearer <token>
 	app := authMiddleware.Handle(mux)
 
 	addr := ":" + cfg.Port
@@ -102,18 +114,27 @@ func main() {
 	log.Println("    GET  /products/{id}         - 商品详情")
 	log.Println("")
 	log.Println("  Card:")
-	log.Println("    POST   /cards               - 绑卡（body: one_time_token）")
+	log.Println("    POST   /cards               - 绑卡")
 	log.Println("    GET    /cards               - 我的卡列表")
 	log.Println("    GET    /cards/{id}          - 卡详情")
-	log.Println("    DELETE /cards/{id}          - 删除卡（软删 + Vault 清除）")
-	log.Println("    POST   /cards/{id}/suspend  - 挂起卡（Active → Suspended）")
-	log.Println("    POST   /cards/{id}/activate - 激活卡（Suspended → Active）")
-	log.Println("    POST   /cards/{id}/default  - 设为默认卡（仅 Active 可设）")
+	log.Println("    DELETE /cards/{id}          - 删除卡")
+	log.Println("    POST   /cards/{id}/suspend  - 挂起卡")
+	log.Println("    POST   /cards/{id}/activate - 激活卡")
+	log.Println("    POST   /cards/{id}/default  - 设为默认卡")
 	log.Println("")
-	log.Println("  Payment:")
-	log.Println("    POST /charge                - 购买（支持 saved_card_id 使用已保存卡）")
-	log.Println("    POST /capture/{id}          - 扣款")
-	log.Println("    POST /refund/{id}           - 退款")
+	log.Println("  Merchant（多商户管理）:")
+	log.Println("    POST   /merchants                                    - 注册商户")
+	log.Println("    GET    /merchants                                    - 商户列表")
+	log.Println("    GET    /merchants/{id}                               - 商户详情")
+	log.Println("    POST   /merchants/{id}/credentials                   - 添加渠道凭据")
+	log.Println("    DELETE /merchants/{id}/credentials/{credID}          - 吊销凭据")
+	log.Println("    POST   /merchants/{id}/suspend                       - 暂停商户")
+	log.Println("")
+	log.Println("  Payment（支持多商户，请求体须携带 merchant_id）:")
+	log.Println("    POST /charge                - Card 购买（merchant_id + token_id/saved_card_id）")
+	log.Println("    POST /charge/paypal         - PayPal 购买（merchant_id + order_id + payer_id）")
+	log.Println("    POST /capture/{id}          - 扣款（按 MerchantID+Method 路由 Gateway）")
+	log.Println("    POST /refund/{id}           - 退款（按 MerchantID+Method 路由 Gateway）")
 	log.Println("    GET  /transaction/{id}      - 查询交易")
 
 	if err := http.ListenAndServe(addr, app); err != nil {

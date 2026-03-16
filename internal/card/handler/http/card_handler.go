@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"strings"
 
 	"payment-demo/internal/card/adapter/auth"
 	"payment-demo/internal/card/application"
@@ -23,14 +22,21 @@ func NewCardHandler(uc *application.CardUseCase) *CardHandler {
 
 // RegisterRoutes 注册路由
 func (h *CardHandler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/cards", h.handleCards)     // POST /cards（绑卡），GET /cards（列表）
-	mux.HandleFunc("/cards/", h.handleCardByID) // GET/DELETE /cards/{id}，子路由见下
+	mux.HandleFunc("/cards", h.handleCards)              // POST（绑卡），GET（列表/详情），DELETE（删卡）
+	mux.HandleFunc("/cards/suspend", h.handleSuspend)    // POST /cards/suspend
+	mux.HandleFunc("/cards/activate", h.handleActivate)  // POST /cards/activate
+	mux.HandleFunc("/cards/default", h.handleSetDefault) // POST /cards/default
 }
 
 // --- Request / Response DTOs ---
 
 type BindCardRequest struct {
 	OneTimeToken string `json:"one_time_token"`
+}
+
+// CardIDRequest 用于需要 card_id 的请求体
+type CardIDRequest struct {
+	CardID string `json:"card_id"`
 }
 
 // CardResponse 卡详情响应体（含 card_id 别名，方便 AC-35 校验）
@@ -50,77 +56,22 @@ type CardResponse struct {
 
 // --- Route Dispatcher ---
 
-// handleCards 处理 POST /cards（绑卡）和 GET /cards（列表）
+// handleCards 处理 POST /cards（绑卡）、GET /cards（列表或详情）、DELETE /cards（删卡）
 func (h *CardHandler) handleCards(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		h.handleBind(w, r)
 	case http.MethodGet:
-		h.handleList(w, r)
+		// 如果有 id 查询参数，返回单张卡详情；否则返回列表
+		if id := r.URL.Query().Get("id"); id != "" {
+			h.handleGet(w, r, id)
+		} else {
+			h.handleList(w, r)
+		}
+	case http.MethodDelete:
+		h.handleDelete(w, r)
 	default:
 		// W-4: 统一使用 jsonError 保证错误响应格式一致
-		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-// handleCardByID 按子路径分发：
-//
-//	DELETE /cards/{id}          → 删除（200 + body）
-//	POST   /cards/{id}/suspend  → 挂起
-//	POST   /cards/{id}/activate → 激活
-//	POST   /cards/{id}/default  → 设为默认（PUT 亦可）
-//	GET    /cards/{id}          → 查详情
-func (h *CardHandler) handleCardByID(w http.ResponseWriter, r *http.Request) {
-	// 路径形如 /cards/{id} 或 /cards/{id}/suspend
-	path := strings.TrimPrefix(r.URL.Path, "/cards/")
-	parts := strings.SplitN(path, "/", 2)
-	cardID := parts[0]
-	if cardID == "" {
-		// W-4: 统一使用 jsonError
-		jsonError(w, "missing card id", http.StatusBadRequest)
-		return
-	}
-
-	if len(parts) == 2 {
-		// 有子路径
-		switch parts[1] {
-		case "suspend":
-			if r.Method != http.MethodPost {
-				// W-4: 统一使用 jsonError
-				jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			h.handleSuspend(w, r, cardID)
-		case "activate":
-			if r.Method != http.MethodPost {
-				// W-4: 统一使用 jsonError
-				jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			h.handleActivate(w, r, cardID)
-		case "default":
-			// AC-41 用 PUT，兼容 POST
-			if r.Method != http.MethodPost && r.Method != http.MethodPut {
-				// W-4: 统一使用 jsonError
-				jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			h.handleSetDefault(w, r, cardID)
-		default:
-			// W-4: 统一使用 jsonError
-			jsonError(w, "not found", http.StatusNotFound)
-		}
-		return
-	}
-
-	// 无子路径：GET 查详情，DELETE 删除
-	switch r.Method {
-	case http.MethodGet:
-		h.handleGet(w, r, cardID)
-	case http.MethodDelete:
-		h.handleDelete(w, r, cardID)
-	default:
-		// W-4: 统一使用 jsonError
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
@@ -180,7 +131,7 @@ func (h *CardHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, resp)
 }
 
-// GET /cards/{id}
+// GET /cards?id=xxx
 func (h *CardHandler) handleGet(w http.ResponseWriter, r *http.Request, cardID string) {
 	userID, ok := auth.UserIDFromContext(r.Context())
 	if !ok {
@@ -197,16 +148,26 @@ func (h *CardHandler) handleGet(w http.ResponseWriter, r *http.Request, cardID s
 	jsonOK(w, toResponse(card))
 }
 
-// DELETE /cards/{id}
+// DELETE /cards with body {"card_id": "xxx"}
 // AC-39 要求 200 OK + {"status":"DELETED"}
-func (h *CardHandler) handleDelete(w http.ResponseWriter, r *http.Request, cardID string) {
+func (h *CardHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
 	userID, ok := auth.UserIDFromContext(r.Context())
 	if !ok {
 		jsonError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	if err := h.useCase.DeleteCard(r.Context(), userID, model.SavedCardID(cardID)); err != nil {
+	var req CardIDRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.CardID == "" {
+		jsonError(w, "card_id is required", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.useCase.DeleteCard(r.Context(), userID, model.SavedCardID(req.CardID)); err != nil {
 		jsonError(w, err.Error(), mapErrorStatus(err))
 		return
 	}
@@ -215,15 +176,30 @@ func (h *CardHandler) handleDelete(w http.ResponseWriter, r *http.Request, cardI
 	jsonOK(w, map[string]string{"status": string(model.CardStatusDeleted)})
 }
 
-// POST /cards/{id}/suspend
-func (h *CardHandler) handleSuspend(w http.ResponseWriter, r *http.Request, cardID string) {
+// POST /cards/suspend with body {"card_id": "xxx"}
+func (h *CardHandler) handleSuspend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	userID, ok := auth.UserIDFromContext(r.Context())
 	if !ok {
 		jsonError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	card, err := h.useCase.SuspendCard(r.Context(), userID, model.SavedCardID(cardID))
+	var req CardIDRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.CardID == "" {
+		jsonError(w, "card_id is required", http.StatusBadRequest)
+		return
+	}
+
+	card, err := h.useCase.SuspendCard(r.Context(), userID, model.SavedCardID(req.CardID))
 	if err != nil {
 		jsonError(w, err.Error(), mapErrorStatus(err))
 		return
@@ -232,15 +208,30 @@ func (h *CardHandler) handleSuspend(w http.ResponseWriter, r *http.Request, card
 	jsonOK(w, toResponse(card))
 }
 
-// POST /cards/{id}/activate
-func (h *CardHandler) handleActivate(w http.ResponseWriter, r *http.Request, cardID string) {
+// POST /cards/activate with body {"card_id": "xxx"}
+func (h *CardHandler) handleActivate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	userID, ok := auth.UserIDFromContext(r.Context())
 	if !ok {
 		jsonError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	card, err := h.useCase.ActivateCard(r.Context(), userID, model.SavedCardID(cardID))
+	var req CardIDRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.CardID == "" {
+		jsonError(w, "card_id is required", http.StatusBadRequest)
+		return
+	}
+
+	card, err := h.useCase.ActivateCard(r.Context(), userID, model.SavedCardID(req.CardID))
 	if err != nil {
 		jsonError(w, err.Error(), mapErrorStatus(err))
 		return
@@ -249,15 +240,30 @@ func (h *CardHandler) handleActivate(w http.ResponseWriter, r *http.Request, car
 	jsonOK(w, toResponse(card))
 }
 
-// POST /cards/{id}/default  (也接受 PUT，兼容 AC-41 用 PUT 的场景)
-func (h *CardHandler) handleSetDefault(w http.ResponseWriter, r *http.Request, cardID string) {
+// POST /cards/default with body {"card_id": "xxx"} (也接受 PUT，兼容 AC-41)
+func (h *CardHandler) handleSetDefault(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	userID, ok := auth.UserIDFromContext(r.Context())
 	if !ok {
 		jsonError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	card, err := h.useCase.SetDefaultCard(r.Context(), userID, model.SavedCardID(cardID))
+	var req CardIDRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.CardID == "" {
+		jsonError(w, "card_id is required", http.StatusBadRequest)
+		return
+	}
+
+	card, err := h.useCase.SetDefaultCard(r.Context(), userID, model.SavedCardID(req.CardID))
 	if err != nil {
 		jsonError(w, err.Error(), mapErrorStatus(err))
 		return

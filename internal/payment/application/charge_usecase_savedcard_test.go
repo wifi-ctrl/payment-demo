@@ -62,17 +62,88 @@ func (q *stubCardQuery) FindActiveCard(_ context.Context, _ string) (*port.Saved
 	return q.view, q.err
 }
 
+// stubNoOpPayPalGateway 占位 PayPal Gateway，Card 测试不会调用它
+type stubNoOpPayPalGateway struct{}
+
+func (g *stubNoOpPayPalGateway) Authorize(_ context.Context, _ paymentModel.PayPalToken, _ paymentModel.Money) (*port.PayPalAuthResult, error) {
+	return nil, nil
+}
+func (g *stubNoOpPayPalGateway) Capture(_ context.Context, _ string, _ paymentModel.Money) error {
+	return nil
+}
+func (g *stubNoOpPayPalGateway) Refund(_ context.Context, _ string, _ paymentModel.Money) error {
+	return nil
+}
+
 // ─────────────────────────────────────────────────────────────────
-// 辅助：组装 ChargeUseCase
+// 多商户测试桩：stubMerchantQuery + stubGatewayFactory
+// 这两个 stub 在所有 application_test 用例中共用
 // ─────────────────────────────────────────────────────────────────
 
+// stubMerchantQuery 可控制 FindActiveCredential 返回
+type stubMerchantQuery struct {
+	cred *port.ChannelCredentialView
+	err  error
+}
+
+func (m *stubMerchantQuery) FindActiveCredential(_ context.Context, _ string, _ paymentModel.PaymentMethod) (*port.ChannelCredentialView, error) {
+	return m.cred, m.err
+}
+
+// activeMerchantCred 返回用于 Card 渠道的测试凭据
+func activeMerchantCred() *port.ChannelCredentialView {
+	return &port.ChannelCredentialView{
+		CredentialID: "cred-1",
+		MerchantID:   "merchant-1",
+		Channel:      "CARD",
+		Secrets:      map[string]string{"api_key": "sk_test_xxx"},
+	}
+}
+
+// activePayPalMerchantCred 返回用于 PayPal 渠道的测试凭据
+func activePayPalMerchantCred() *port.ChannelCredentialView {
+	return &port.ChannelCredentialView{
+		CredentialID: "cred-2",
+		MerchantID:   "merchant-1",
+		Channel:      "PAYPAL",
+		Secrets:      map[string]string{"client_id": "cl_xxx", "client_secret": "sec_xxx"},
+	}
+}
+
+// stubGatewayFactory 根据渠道返回对应的 stub Gateway
+type stubGatewayFactory struct {
+	cardGateway   port.PaymentGateway
+	paypalGateway port.PayPalGateway
+	buildCardErr  error
+	buildPPErr    error
+}
+
+func (f *stubGatewayFactory) BuildCardGateway(_ port.ChannelCredentialView) (port.PaymentGateway, error) {
+	return f.cardGateway, f.buildCardErr
+}
+
+func (f *stubGatewayFactory) BuildPayPalGateway(_ port.ChannelCredentialView) (port.PayPalGateway, error) {
+	return f.paypalGateway, f.buildPPErr
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 辅助：组装 ChargeUseCase（Card 测试用）
+// ─────────────────────────────────────────────────────────────────
+
+// buildChargeUseCase 构建用于 Card 支付测试的 UseCase。
+// merchantQuery 提供固定商户凭据（CARD 渠道），gatewayFactory 返回传入的 cardGw。
 func buildChargeUseCase(
-	gw port.PaymentGateway,
+	cardGw port.PaymentGateway,
 	catalog port.CatalogQuery,
 	cardQuery port.CardQuery,
 ) *application.ChargeUseCase {
 	repo := persistence.NewInMemoryTransactionRepository()
-	return application.NewChargeUseCase(gw, repo, catalog, cardQuery)
+	merchantQ := &stubMerchantQuery{cred: activeMerchantCred()}
+	factory := &stubGatewayFactory{
+		cardGateway:   cardGw,
+		paypalGateway: &stubNoOpPayPalGateway{},
+	}
+	return application.NewChargeUseCase(merchantQ, factory, repo, catalog, cardQuery)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -97,6 +168,7 @@ func TestChargeUseCase_Purchase_WithSavedCard_Succeeds(t *testing.T) {
 
 	uc := buildChargeUseCase(gw, catalog, cardQuery)
 	txn, err := uc.Purchase(context.Background(), application.PurchaseRequest{
+		MerchantID:  "merchant-1",
 		UserID:      "user-1",
 		ProductID:   "prod-1",
 		SavedCardID: "card-1",
@@ -145,6 +217,7 @@ func TestChargeUseCase_Purchase_WithSuspendedSavedCard_ReturnsError(t *testing.T
 
 	uc := buildChargeUseCase(gw, catalog, cardQuery)
 	_, err := uc.Purchase(context.Background(), application.PurchaseRequest{
+		MerchantID:  "merchant-1",
 		UserID:      "user-1",
 		ProductID:   "prod-1",
 		SavedCardID: "card-sus",
@@ -170,6 +243,7 @@ func TestChargeUseCase_Purchase_CardQueryFails_ReturnsError(t *testing.T) {
 
 	uc := buildChargeUseCase(gw, catalog, cardQuery)
 	_, err := uc.Purchase(context.Background(), application.PurchaseRequest{
+		MerchantID:  "merchant-1",
 		UserID:      "user-1",
 		ProductID:   "prod-1",
 		SavedCardID: "card-999",
@@ -198,6 +272,7 @@ func TestChargeUseCase_Purchase_CardBelongsToOtherUser_ReturnsError(t *testing.T
 
 	uc := buildChargeUseCase(gw, catalog, cardQuery)
 	_, err := uc.Purchase(context.Background(), application.PurchaseRequest{
+		MerchantID:  "merchant-1",
 		UserID:      "user-1",
 		ProductID:   "prod-1",
 		SavedCardID: "card-1",
@@ -216,21 +291,17 @@ func TestChargeUseCase_Purchase_WithOneTimeToken_DoesNotCallCardQuery(t *testing
 		authorizeResult: &port.GatewayAuthResult{ProviderRef: "pi_002", AuthCode: "AUTH_002"},
 	}
 	catalog := &stubCatalog{product: activeProduct()}
-	var cardQueryCalled bool
-	cardQuery := &stubCardQuery{}
-	// 用 wrapper 检测是否被调用
-	_ = cardQuery // 下面用 stubCardQuerySpy 更简洁
 
-	// 直接用 spy 结构
+	// 用 spy 检测 CardQuery 是否被调用
 	spy := &spyCardQuery{}
 	uc := buildChargeUseCase(gw, catalog, spy)
 	_, err := uc.Purchase(context.Background(), application.PurchaseRequest{
-		UserID:    "user-1",
-		ProductID: "prod-1",
-		Token:     paymentModel.CardToken{TokenID: "tok_onetime", Last4: "1111", Brand: "Mastercard"},
+		MerchantID: "merchant-1",
+		UserID:     "user-1",
+		ProductID:  "prod-1",
+		Token:      paymentModel.CardToken{TokenID: "tok_onetime", Last4: "1111", Brand: "Mastercard"},
 		// SavedCardID 为空
 	})
-	_ = cardQueryCalled
 	if err != nil {
 		t.Fatalf("want nil error, got %v", err)
 	}
@@ -246,4 +317,49 @@ type spyCardQuery struct {
 func (q *spyCardQuery) FindActiveCard(_ context.Context, _ string) (*port.SavedCardView, error) {
 	q.called = true
 	return nil, nil
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 多商户专项：Purchase 时 merchant_id 为空 → ErrMerchantRequired
+// ─────────────────────────────────────────────────────────────────
+
+func TestChargeUseCase_Purchase_MissingMerchantID_ReturnsError(t *testing.T) {
+	gw := &stubGateway{}
+	catalog := &stubCatalog{product: activeProduct()}
+	uc := buildChargeUseCase(gw, catalog, &stubCardQuery{})
+
+	_, err := uc.Purchase(context.Background(), application.PurchaseRequest{
+		MerchantID: "", // 缺失
+		UserID:     "user-1",
+		ProductID:  "prod-1",
+		Token:      paymentModel.CardToken{TokenID: "tok_xxx"},
+	})
+	if !errors.Is(err, paymentModel.ErrMerchantRequired) {
+		t.Errorf("want ErrMerchantRequired, got %v", err)
+	}
+	if gw.authorizeCalled {
+		t.Error("Authorize must NOT be called when MerchantID is missing")
+	}
+}
+
+// 多商户专项：MerchantQuery 返回凭据不存在 → Purchase 中止
+func TestChargeUseCase_Purchase_MerchantCredentialNotFound_ReturnsError(t *testing.T) {
+	gw := &stubGateway{}
+	repo := persistence.NewInMemoryTransactionRepository()
+	merchantQ := &stubMerchantQuery{err: port.ErrMerchantCredentialNotFound}
+	factory := &stubGatewayFactory{cardGateway: gw, paypalGateway: &stubNoOpPayPalGateway{}}
+	uc := application.NewChargeUseCase(merchantQ, factory, repo, &stubCatalog{product: activeProduct()}, &stubCardQuery{})
+
+	_, err := uc.Purchase(context.Background(), application.PurchaseRequest{
+		MerchantID: "merchant-unknown",
+		UserID:     "user-1",
+		ProductID:  "prod-1",
+		Token:      paymentModel.CardToken{TokenID: "tok_xxx"},
+	})
+	if !errors.Is(err, port.ErrMerchantCredentialNotFound) {
+		t.Errorf("want ErrMerchantCredentialNotFound, got %v", err)
+	}
+	if gw.authorizeCalled {
+		t.Error("Authorize must NOT be called when credential is not found")
+	}
 }

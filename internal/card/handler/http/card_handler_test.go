@@ -229,7 +229,7 @@ func TestCardHandler_BindCard_VaultFails_Returns502(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// AC-37  POST /cards/{id}/suspend 挂起成功 → 200 + status=SUSPENDED
+// AC-37  POST /cards/suspend 挂起成功 → 200 + status=SUSPENDED
 // ─────────────────────────────────────────────────────────────────
 
 func TestCardHandler_SuspendCard_Success_Returns200(t *testing.T) {
@@ -243,7 +243,9 @@ func TestCardHandler_SuspendCard_Success_Returns200(t *testing.T) {
 	repo.seed(card)
 
 	handler := setup(repo, successVault(), "user-1")
-	w := doRequest(handler, http.MethodPost, "/cards/"+string(card.ID)+"/suspend", nil)
+	w := doRequest(handler, http.MethodPost, "/cards/suspend", jsonBody(map[string]string{
+		"card_id": string(card.ID),
+	}))
 
 	if w.Code != http.StatusOK {
 		t.Errorf("want 200, got %d (body: %s)", w.Code, w.Body.String())
@@ -257,7 +259,7 @@ func TestCardHandler_SuspendCard_Success_Returns200(t *testing.T) {
 	}
 }
 
-// AC-38  POST /cards/{id}/suspend 操作他人卡 → 403
+// AC-38  POST /cards/suspend 操作他人卡 → 403
 func TestCardHandler_SuspendCard_OtherUserCard_Returns403(t *testing.T) {
 	repo := newTestRepo()
 	// 卡属于 user-2
@@ -270,7 +272,9 @@ func TestCardHandler_SuspendCard_OtherUserCard_Returns403(t *testing.T) {
 
 	// 以 user-1 身份发请求
 	handler := setup(repo, successVault(), "user-1")
-	w := doRequest(handler, http.MethodPost, "/cards/"+string(card.ID)+"/suspend", nil)
+	w := doRequest(handler, http.MethodPost, "/cards/suspend", jsonBody(map[string]string{
+		"card_id": string(card.ID),
+	}))
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("want 403, got %d (body: %s)", w.Code, w.Body.String())
@@ -284,12 +288,14 @@ func TestCardHandler_SuspendCard_OtherUserCard_Returns403(t *testing.T) {
 	}
 }
 
-// AC-42  POST /cards/{id}/suspend 卡不存在 → 404
+// AC-42  POST /cards/suspend 卡不存在 → 404
 func TestCardHandler_SuspendCard_NotFound_Returns404(t *testing.T) {
 	repo := newTestRepo()
 	handler := setup(repo, successVault(), "user-1")
 
-	w := doRequest(handler, http.MethodPost, "/cards/card-999/suspend", nil)
+	w := doRequest(handler, http.MethodPost, "/cards/suspend", jsonBody(map[string]string{
+		"card_id": "card-999",
+	}))
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("want 404, got %d (body: %s)", w.Code, w.Body.String())
@@ -304,7 +310,7 @@ func TestCardHandler_SuspendCard_NotFound_Returns404(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// AC-39  DELETE /cards/{id} 删除成功 → 200 + {"status":"DELETED"}
+// AC-39  DELETE /cards 删除成功 → 200 + {"status":"DELETED"}
 // ─────────────────────────────────────────────────────────────────
 
 func TestCardHandler_DeleteCard_Success_Returns200WithStatus(t *testing.T) {
@@ -317,7 +323,9 @@ func TestCardHandler_DeleteCard_Success_Returns200WithStatus(t *testing.T) {
 	repo.seed(card)
 
 	handler := setup(repo, successVault(), "user-1")
-	w := doRequest(handler, http.MethodDelete, "/cards/"+string(card.ID), nil)
+	w := doRequest(handler, http.MethodDelete, "/cards", jsonBody(map[string]string{
+		"card_id": string(card.ID),
+	}))
 
 	// AC-39 要求 200 OK
 	if w.Code != http.StatusOK {
@@ -333,10 +341,12 @@ func TestCardHandler_DeleteCard_Success_Returns200WithStatus(t *testing.T) {
 	}
 }
 
-// DELETE /cards/{id} 无 userID → 401
+// DELETE /cards 无 userID → 401
 func TestCardHandler_DeleteCard_NoAuth_Returns401(t *testing.T) {
 	handler := setupNoAuth(newTestRepo(), successVault())
-	w := doRequest(handler, http.MethodDelete, "/cards/card-1", nil)
+	w := doRequest(handler, http.MethodDelete, "/cards", jsonBody(map[string]string{
+		"card_id": "card-1",
+	}))
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("want 401, got %d", w.Code)
@@ -416,9 +426,9 @@ func TestCardHandler_ListCards_NoAuth_Returns401(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// AC-41  PUT /cards/{id}/default 切换默认卡 → 200
+// AC-41  PUT /cards/default 切换默认卡 → 200
 //
-//	（POST /cards/{id}/default 同样被 handler 接受）
+//	（POST /cards/default 同样被 handler 接受）
 //
 // ─────────────────────────────────────────────────────────────────
 func TestCardHandler_SetDefault_SwitchesDefault_Returns200(t *testing.T) {
@@ -443,7 +453,9 @@ func TestCardHandler_SetDefault_SwitchesDefault_Returns200(t *testing.T) {
 	handler := setup(repo, successVault(), "user-1")
 
 	// AC-41 使用 PUT 方法
-	w := doRequest(handler, http.MethodPut, "/cards/"+string(newCard.ID)+"/default", nil)
+	w := doRequest(handler, http.MethodPut, "/cards/default", jsonBody(map[string]string{
+		"card_id": string(newCard.ID),
+	}))
 
 	if w.Code != http.StatusOK {
 		t.Errorf("want 200, got %d (body: %s)", w.Code, w.Body.String())
@@ -460,7 +472,7 @@ func TestCardHandler_SetDefault_SwitchesDefault_Returns200(t *testing.T) {
 	}
 }
 
-// POST /cards/{id}/default 对 Suspended 卡 → 422
+// POST /cards/default 对 Suspended 卡 → 422
 func TestCardHandler_SetDefault_SuspendedCard_Returns422(t *testing.T) {
 	repo := newTestRepo()
 
@@ -474,7 +486,9 @@ func TestCardHandler_SetDefault_SuspendedCard_Returns422(t *testing.T) {
 	repo.seed(suspendedCard)
 
 	handler := setup(repo, successVault(), "user-1")
-	w := doRequest(handler, http.MethodPost, "/cards/"+string(suspendedCard.ID)+"/default", nil)
+	w := doRequest(handler, http.MethodPost, "/cards/default", jsonBody(map[string]string{
+		"card_id": string(suspendedCard.ID),
+	}))
 
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Errorf("want 422, got %d (body: %s)", w.Code, w.Body.String())
@@ -482,7 +496,7 @@ func TestCardHandler_SetDefault_SuspendedCard_Returns422(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// POST /cards/{id}/activate — 激活挂起卡
+// POST /cards/activate — 激活挂起卡
 // ─────────────────────────────────────────────────────────────────
 
 func TestCardHandler_ActivateCard_FromSuspended_Returns200(t *testing.T) {
@@ -498,7 +512,9 @@ func TestCardHandler_ActivateCard_FromSuspended_Returns200(t *testing.T) {
 	repo.seed(card)
 
 	handler := setup(repo, successVault(), "user-1")
-	w := doRequest(handler, http.MethodPost, "/cards/"+string(card.ID)+"/activate", nil)
+	w := doRequest(handler, http.MethodPost, "/cards/activate", jsonBody(map[string]string{
+		"card_id": string(card.ID),
+	}))
 
 	if w.Code != http.StatusOK {
 		t.Errorf("want 200, got %d (body: %s)", w.Code, w.Body.String())
@@ -513,7 +529,7 @@ func TestCardHandler_ActivateCard_FromSuspended_Returns200(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// GET /cards/{id} — 查询单张卡详情
+// GET /cards?id=xxx — 查询单张卡详情
 // ─────────────────────────────────────────────────────────────────
 
 func TestCardHandler_GetCard_Success_Returns200(t *testing.T) {
@@ -527,7 +543,7 @@ func TestCardHandler_GetCard_Success_Returns200(t *testing.T) {
 	repo.seed(card)
 
 	handler := setup(repo, successVault(), "user-1")
-	w := doRequest(handler, http.MethodGet, "/cards/"+string(card.ID), nil)
+	w := doRequest(handler, http.MethodGet, "/cards?id="+string(card.ID), nil)
 
 	if w.Code != http.StatusOK {
 		t.Errorf("want 200, got %d (body: %s)", w.Code, w.Body.String())
@@ -544,10 +560,10 @@ func TestCardHandler_GetCard_Success_Returns200(t *testing.T) {
 	}
 }
 
-// GET /cards/{id} 卡不存在 → 404
+// GET /cards?id=xxx 卡不存在 → 404
 func TestCardHandler_GetCard_NotFound_Returns404(t *testing.T) {
 	handler := setup(newTestRepo(), successVault(), "user-1")
-	w := doRequest(handler, http.MethodGet, "/cards/card-nonexistent", nil)
+	w := doRequest(handler, http.MethodGet, "/cards?id=card-nonexistent", nil)
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("want 404, got %d", w.Code)
@@ -555,7 +571,7 @@ func TestCardHandler_GetCard_NotFound_Returns404(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// POST /cards/{id}/suspend 挂起已挂起的卡 → 409 Conflict
+// POST /cards/suspend 挂起已挂起的卡 → 409 Conflict
 // ─────────────────────────────────────────────────────────────────
 
 func TestCardHandler_SuspendCard_AlreadySuspended_Returns409(t *testing.T) {
@@ -571,7 +587,9 @@ func TestCardHandler_SuspendCard_AlreadySuspended_Returns409(t *testing.T) {
 	repo.seed(card)
 
 	handler := setup(repo, successVault(), "user-1")
-	w := doRequest(handler, http.MethodPost, "/cards/"+string(card.ID)+"/suspend", nil)
+	w := doRequest(handler, http.MethodPost, "/cards/suspend", jsonBody(map[string]string{
+		"card_id": string(card.ID),
+	}))
 
 	if w.Code != http.StatusConflict {
 		t.Errorf("want 409, got %d (body: %s)", w.Code, w.Body.String())
