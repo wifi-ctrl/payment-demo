@@ -135,6 +135,20 @@ func (f *stubGatewayFactory) BuildPayPalGateway(_ port.ChannelCredentialView) (p
 	return f.paypalGateway, f.buildPPErr
 }
 
+// --- CardCommand ---
+
+type stubCardCommand struct{}
+
+func (c *stubCardCommand) StoreChannelToken(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+func (c *stubCardCommand) BindCardFromToken(_ context.Context, _ port.BindFromTokenCommand) (string, error) {
+	return "card-new", nil
+}
+func (c *stubCardCommand) PrepareOneTimeToken(_ context.Context, _, _ string) (string, error) {
+	return "ct_onetime_xxx", nil
+}
+
 // --- UseCase 组装辅助 ---
 
 func buildChargeUseCase(
@@ -148,7 +162,7 @@ func buildChargeUseCase(
 		cardGateway:   cardGw,
 		paypalGateway: &stubNoOpPayPalGateway{},
 	}
-	return application.NewChargeUseCase(merchantQ, factory, repo, catalog, cardQuery, nil, nil)
+	return application.NewChargeUseCase(merchantQ, factory, repo, catalog, cardQuery, &stubCardCommand{}, nil, nil)
 }
 
 // --- Spy stubs（商户路由验证用）---
@@ -290,12 +304,12 @@ func TestChargeUseCase_Purchase_WithSavedCard_Succeeds(t *testing.T) {
 	catalog := &stubCatalog{product: activeProduct()}
 	cardQuery := &stubCardQuery{
 		view: &port.SavedCardView{
-			CardID:   "card-1",
-			UserID:   "user-1",
-			Token:    "tok_saved",
-			Last4:    "4242",
-			Brand:    "Visa",
-			IsActive: true,
+			CardID:        "card-1",
+			UserID:        "user-1",
+			ChannelTokens: map[string]string{"CARD": "tok_saved"},
+			Last4:         "4242",
+			Brand:         "Visa",
+			IsActive:      true,
 		},
 	}
 
@@ -335,10 +349,10 @@ func TestChargeUseCase_Purchase_WithSuspendedSavedCard_ReturnsError(t *testing.T
 	catalog := &stubCatalog{product: activeProduct()}
 	cardQuery := &stubCardQuery{
 		view: &port.SavedCardView{
-			CardID:   "card-sus",
-			UserID:   "user-1",
-			Token:    "tok_sus",
-			IsActive: false,
+			CardID:        "card-sus",
+			UserID:        "user-1",
+			ChannelTokens: map[string]string{"CARD": "tok_sus"},
+			IsActive:      false,
 		},
 	}
 
@@ -387,10 +401,10 @@ func TestChargeUseCase_Purchase_CardBelongsToOtherUser_ReturnsError(t *testing.T
 	catalog := &stubCatalog{product: activeProduct()}
 	cardQuery := &stubCardQuery{
 		view: &port.SavedCardView{
-			CardID:   "card-1",
-			UserID:   "other-user",
-			Token:    "tok_abc",
-			IsActive: true,
+			CardID:        "card-1",
+			UserID:        "other-user",
+			ChannelTokens: map[string]string{"CARD": "tok_abc"},
+			IsActive:      true,
 		},
 	}
 
@@ -455,7 +469,7 @@ func TestChargeUseCase_Purchase_MerchantCredentialNotFound_ReturnsError(t *testi
 	repo := persistence.NewInMemoryTransactionRepository()
 	merchantQ := &stubMerchantQuery{err: port.ErrMerchantCredentialNotFound}
 	factory := &stubGatewayFactory{cardGateway: gw, paypalGateway: &stubNoOpPayPalGateway{}}
-	uc := application.NewChargeUseCase(merchantQ, factory, repo, &stubCatalog{product: activeProduct()}, &stubCardQuery{}, nil, nil)
+	uc := application.NewChargeUseCase(merchantQ, factory, repo, &stubCatalog{product: activeProduct()}, &stubCardQuery{}, &stubCardCommand{}, nil, nil)
 
 	_, err := uc.Purchase(context.Background(), application.PurchaseRequest{
 		MerchantID: "merchant-unknown",
@@ -487,7 +501,7 @@ func TestChargeUseCase_Purchase_MerchantRouting_Success(t *testing.T) {
 	catalog := &stubCatalog{product: activeProduct()}
 	cardQ := &stubCardQuery{}
 
-	uc := application.NewChargeUseCase(merchantQ, gwFactory, txnRepo, catalog, cardQ, nil, nil)
+	uc := application.NewChargeUseCase(merchantQ, gwFactory, txnRepo, catalog, cardQ, &stubCardCommand{}, nil, nil)
 
 	txn, err := uc.Purchase(context.Background(), application.PurchaseRequest{
 		MerchantID: merchantID,
@@ -535,7 +549,7 @@ func TestChargeUseCase_Purchase_MerchantCredentialNotFound_DoesNotSave(t *testin
 	catalog := &stubCatalog{product: activeProduct()}
 	cardQ := &stubCardQuery{}
 
-	uc := application.NewChargeUseCase(merchantQ, gwFactory, txnRepo, catalog, cardQ, nil, nil)
+	uc := application.NewChargeUseCase(merchantQ, gwFactory, txnRepo, catalog, cardQ, &stubCardCommand{}, nil, nil)
 
 	_, err := uc.Purchase(context.Background(), application.PurchaseRequest{
 		MerchantID: "merchant-001",
@@ -561,7 +575,7 @@ func TestChargeUseCase_Purchase_GatewayBuildFails_ReturnsError(t *testing.T) {
 	catalog := &stubCatalog{product: activeProduct()}
 	cardQ := &stubCardQuery{}
 
-	uc := application.NewChargeUseCase(merchantQ, gwFactory, txnRepo, catalog, cardQ, nil, nil)
+	uc := application.NewChargeUseCase(merchantQ, gwFactory, txnRepo, catalog, cardQ, &stubCardCommand{}, nil, nil)
 
 	_, err := uc.Purchase(context.Background(), application.PurchaseRequest{
 		MerchantID: "merchant-1",
@@ -596,7 +610,7 @@ func TestPurchase_WithCouponCode_UsesFinalAmount(t *testing.T) {
 
 	merchantQ := &stubMerchantQuery{cred: activeMerchantCred()}
 	factory := &stubGatewayFactory{cardGateway: gw, paypalGateway: &stubNoOpPayPalGateway{}}
-	uc := application.NewChargeUseCase(merchantQ, factory, txnRepo, catalogQ, &stubCardQuery{}, couponApplier, taxQ)
+	uc := application.NewChargeUseCase(merchantQ, factory, txnRepo, catalogQ, &stubCardQuery{}, &stubCardCommand{}, couponApplier, taxQ)
 
 	txn, err := uc.Purchase(context.Background(), application.PurchaseRequest{
 		MerchantID: "m1", UserID: "u1", ProductID: "p1",
@@ -639,7 +653,7 @@ func TestPurchase_WithoutCoupon_UsesCatalogPricePlusTax(t *testing.T) {
 
 	merchantQ := &stubMerchantQuery{cred: activeMerchantCred()}
 	factory := &stubGatewayFactory{cardGateway: gw, paypalGateway: &stubNoOpPayPalGateway{}}
-	uc := application.NewChargeUseCase(merchantQ, factory, txnRepo, catalogQ, &stubCardQuery{}, nil, taxQ)
+	uc := application.NewChargeUseCase(merchantQ, factory, txnRepo, catalogQ, &stubCardQuery{}, &stubCardCommand{}, nil, taxQ)
 
 	txn, err := uc.Purchase(context.Background(), application.PurchaseRequest{
 		MerchantID: "m1", UserID: "u1", ProductID: "p1",
@@ -668,7 +682,7 @@ func TestPurchase_NoCouponNoTax_UsesCatalogPrice(t *testing.T) {
 
 	merchantQ := &stubMerchantQuery{cred: activeMerchantCred()}
 	factory := &stubGatewayFactory{cardGateway: gw, paypalGateway: &stubNoOpPayPalGateway{}}
-	uc := application.NewChargeUseCase(merchantQ, factory, txnRepo, catalogQ, &stubCardQuery{}, nil, nil)
+	uc := application.NewChargeUseCase(merchantQ, factory, txnRepo, catalogQ, &stubCardQuery{}, &stubCardCommand{}, nil, nil)
 
 	txn, err := uc.Purchase(context.Background(), application.PurchaseRequest{
 		MerchantID: "m1", UserID: "u1", ProductID: "p1",
@@ -699,7 +713,7 @@ func TestPurchase_CouponNotFound_ReturnsError(t *testing.T) {
 
 	merchantQ := &stubMerchantQuery{cred: activeMerchantCred()}
 	factory := &stubGatewayFactory{cardGateway: gw, paypalGateway: &stubNoOpPayPalGateway{}}
-	uc := application.NewChargeUseCase(merchantQ, factory, txnRepo, catalogQ, &stubCardQuery{}, couponApplier, nil)
+	uc := application.NewChargeUseCase(merchantQ, factory, txnRepo, catalogQ, &stubCardQuery{}, &stubCardCommand{}, couponApplier, nil)
 
 	_, err := uc.Purchase(context.Background(), application.PurchaseRequest{
 		MerchantID: "m1", UserID: "u1", ProductID: "p1",
@@ -726,7 +740,7 @@ func TestPurchase_AuthFailed_RollbacksCoupon(t *testing.T) {
 
 	merchantQ := &stubMerchantQuery{cred: activeMerchantCred()}
 	factory := &stubGatewayFactory{cardGateway: gw, paypalGateway: &stubNoOpPayPalGateway{}}
-	uc := application.NewChargeUseCase(merchantQ, factory, txnRepo, catalogQ, &stubCardQuery{}, couponApplier, nil)
+	uc := application.NewChargeUseCase(merchantQ, factory, txnRepo, catalogQ, &stubCardQuery{}, &stubCardCommand{}, couponApplier, nil)
 
 	_, err := uc.Purchase(context.Background(), application.PurchaseRequest{
 		MerchantID: "m1", UserID: "u1", ProductID: "p1",

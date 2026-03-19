@@ -15,7 +15,8 @@ import (
 func newTestCard(userID string) *model.SavedCard {
 	return model.NewSavedCard(
 		userID,
-		model.VaultToken{Token: "vault_tok_001", Provider: "mock"},
+		model.EncryptedPAN{Ciphertext: []byte("mock-cipher"), KeyVersion: 1},
+		model.PANHash("mock-hash-4242"),
 		model.CardMask{Last4: "4242", Brand: "Visa", ExpireMonth: 12, ExpireYear: 2028},
 		model.CardHolder{Name: "Alice", BillingCountry: "US"},
 	)
@@ -454,16 +455,21 @@ func TestSavedCard_ClearEvents_ReturnsAndClearsAll(t *testing.T) {
 // 值对象相等性
 // ─────────────────────────────────────────────────────────────────
 
-func TestVaultToken_Equality(t *testing.T) {
-	a := model.VaultToken{Token: "tok_abc", Provider: "stripe"}
-	b := model.VaultToken{Token: "tok_abc", Provider: "stripe"}
-	c := model.VaultToken{Token: "tok_xyz", Provider: "stripe"}
+func TestChannelToken_StoreAndRevoke(t *testing.T) {
+	card := newTestCard("user-1")
+	card.StoreChannelToken("stripe", "pm_123", "shopper_1")
 
-	if a != b {
-		t.Error("identical VaultTokens should be equal")
+	ct := card.GetActiveChannelToken("stripe")
+	if ct == nil {
+		t.Fatal("want active channel token for stripe")
 	}
-	if a == c {
-		t.Error("different VaultTokens should not be equal")
+	if ct.Token != "pm_123" {
+		t.Errorf("want token pm_123, got %s", ct.Token)
+	}
+
+	card.RevokeChannelToken("stripe")
+	if card.GetActiveChannelToken("stripe") != nil {
+		t.Error("want nil after revoke")
 	}
 }
 

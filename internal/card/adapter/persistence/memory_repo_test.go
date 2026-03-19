@@ -16,7 +16,8 @@ import (
 func newCard(userID string) *model.SavedCard {
 	return model.NewSavedCard(
 		userID,
-		model.VaultToken{Token: "tok_001", Provider: "mock"},
+		model.EncryptedPAN{Ciphertext: []byte("mock-cipher"), KeyVersion: 1},
+		model.PANHash("mock-hash-4242"),
 		model.CardMask{Last4: "4242", Brand: "Visa", ExpireMonth: 12, ExpireYear: 2028},
 		model.CardHolder{Name: "Alice", BillingCountry: "US"},
 	)

@@ -23,8 +23,10 @@ type PaymentGateway interface {
 
 // GatewayAuthResult 网关授权结果 — 接口绑定的 DTO，放在 port 中。
 type GatewayAuthResult struct {
-	ProviderRef string
-	AuthCode    string
+	ProviderRef    string
+	AuthCode       string
+	RecurringToken string // 渠道返回的复购 token（首次支付时非空）
+	Channel        string // 实际使用的渠道标识
 }
 
 // GatewayFactory 根据商户渠道凭据动态构造 Gateway 实例（被驱动端口）。

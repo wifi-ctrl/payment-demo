@@ -164,7 +164,7 @@ func buildPayPalUseCase(
 		cardGateway:   cardGw,
 		paypalGateway: paypalGw,
 	}
-	return application.NewChargeUseCase(merchantQ, factory, repo, catalog, cardQuery, nil, nil)
+	return application.NewChargeUseCase(merchantQ, factory, repo, catalog, cardQuery, &stubCardCommand{}, nil, nil)
 }
 
 func buildUseCase(
@@ -182,7 +182,7 @@ func buildUseCase(
 		cardGateway:   cardGw,
 		paypalGateway: paypalGw,
 	}
-	return application.NewChargeUseCase(merchantQ, factory, repo, catalog, cardQuery, nil, nil)
+	return application.NewChargeUseCase(merchantQ, factory, repo, catalog, cardQuery, &stubCardCommand{}, nil, nil)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -433,7 +433,7 @@ func TestChargeUseCase_PayPalPurchase_MerchantRouting_Success(t *testing.T) {
 	catalog := &stubCatalog{product: activeProduct()}
 	cardQ := &stubCardQuery{}
 
-	uc := application.NewChargeUseCase(merchantQ, gwFactory, txnRepo, catalog, cardQ, nil, nil)
+	uc := application.NewChargeUseCase(merchantQ, gwFactory, txnRepo, catalog, cardQ, &stubCardCommand{}, nil, nil)
 
 	txn, err := uc.PayPalPurchase(context.Background(), application.PayPalPurchaseRequest{
 		MerchantID: merchantID,
@@ -478,7 +478,7 @@ func TestChargeUseCase_PayPalPurchase_MerchantCredentialNotFound_DoesNotSave(t *
 	catalog := &stubCatalog{product: activeProduct()}
 	cardQ := &stubCardQuery{}
 
-	uc := application.NewChargeUseCase(merchantQ, gwFactory, txnRepo, catalog, cardQ, nil, nil)
+	uc := application.NewChargeUseCase(merchantQ, gwFactory, txnRepo, catalog, cardQ, &stubCardCommand{}, nil, nil)
 
 	_, err := uc.PayPalPurchase(context.Background(), application.PayPalPurchaseRequest{
 		MerchantID: "merchant-001",
@@ -655,7 +655,7 @@ func TestNewChargeUseCase_WithPayPalGateway_Compiles(t *testing.T) {
 	}
 	factory := &stubGatewayFactory{cardGateway: cardGw, paypalGateway: paypalGw}
 
-	uc := application.NewChargeUseCase(merchantQ, factory, repo, catalog, cardQuery, nil, nil)
+	uc := application.NewChargeUseCase(merchantQ, factory, repo, catalog, cardQuery, &stubCardCommand{}, nil, nil)
 	if uc == nil {
 		t.Fatal("want non-nil ChargeUseCase, got nil")
 	}

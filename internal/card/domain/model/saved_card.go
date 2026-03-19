@@ -19,90 +19,89 @@ func NewSavedCardID() SavedCardID {
 type CardStatus string
 
 const (
-	CardStatusActive    CardStatus = "ACTIVE"    // 正常可用
-	CardStatusSuspended CardStatus = "SUSPENDED" // 已挂起（冻结）
-	CardStatusDeleted   CardStatus = "DELETED"   // 已删除（软删）
+	CardStatusActive    CardStatus = "ACTIVE"
+	CardStatusSuspended CardStatus = "SUSPENDED"
+	CardStatusDeleted   CardStatus = "DELETED"
 )
-
-// VaultToken 第三方 Vault 持久令牌（不透明值对象）
-type VaultToken struct {
-	Token    string // Vault 侧唯一标识
-	Provider string // 如 "stripe"、"braintree"
-}
 
 // CardMask 脱敏卡信息值对象（不可变，展示用）
 type CardMask struct {
-	Last4       string // 后四位
-	Brand       string // Visa / Mastercard / UnionPay ...
-	ExpireMonth int    // 1-12
-	ExpireYear  int    // 如 2028
+	Last4       string
+	Brand       string
+	ExpireMonth int
+	ExpireYear  int
 }
 
 // CardHolder 持卡人值对象
 type CardHolder struct {
 	Name           string
-	BillingCountry string // ISO 3166-1 alpha-2，如 "US"
+	BillingCountry string
 }
 
-// SavedCard 已保存卡聚合根
+// SavedCard 已保存卡聚合根（Card Vault 模式）
 // 状态机: Active ⇄ Suspended，Active/Suspended → Deleted（终态不可逆）
 type SavedCard struct {
-	ID         SavedCardID
-	UserID     string     // 归属用户，来自 identity 上下文 ctx
-	VaultToken VaultToken // 托管在 Vault 的持久令牌，替代原始卡号
-	Mask       CardMask   // 脱敏展示信息
-	Holder     CardHolder // 持卡人
-	IsDefault  bool       // 是否为用户默认支付卡
-	Status     CardStatus
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
-	Events     []event.DomainEvent // 未发布的领域事件
+	ID            SavedCardID
+	UserID        string
+	EncryptedPAN  EncryptedPAN    // AES-256-GCM 加密的完整卡号
+	PANHash       PANHash         // HMAC-SHA-256 哈希，查重用
+	Mask          CardMask        // 脱敏展示信息
+	Holder        CardHolder      // 持卡人
+	ChannelTokens []ChannelToken  // 一卡多渠道的 recurring token
+	IsDefault     bool
+	Status        CardStatus
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	Events        []event.DomainEvent
 }
 
-// NewSavedCard 工厂方法：创建一张新绑定的卡（初始 Active）
-// vaultToken 由 application 层调用 CardVault Gateway 换取后传入
-func NewSavedCard(userID string, token VaultToken, mask CardMask, holder CardHolder) *SavedCard {
+// NewSavedCard 工厂方法
+func NewSavedCard(
+	userID string,
+	encrypted EncryptedPAN,
+	panHash PANHash,
+	mask CardMask,
+	holder CardHolder,
+) *SavedCard {
 	return &SavedCard{
-		ID:         NewSavedCardID(),
-		UserID:     userID,
-		VaultToken: token,
-		Mask:       mask,
-		Holder:     holder,
-		IsDefault:  false,
-		Status:     CardStatusActive,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+		ID:           NewSavedCardID(),
+		UserID:       userID,
+		EncryptedPAN: encrypted,
+		PANHash:      panHash,
+		Mask:         mask,
+		Holder:       holder,
+		IsDefault:    false,
+		Status:       CardStatusActive,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
 	}
 }
 
-// BindAsDefault 绑卡后标记为默认卡，同时发布 CardBound 事件
-// 由 usecase 判断"用户尚无已有卡"时调用；若已有卡则只调 Bind（不设默认）
+// ── 绑卡行为 ──────────────────────────────────────────────────────
+
 func (c *SavedCard) BindAsDefault() {
 	c.IsDefault = true
 	c.UpdatedAt = time.Now()
-	c.addEvent(event.CardBound{
-		CardID:     string(c.ID),
-		UserID:     c.UserID,
-		Last4:      c.Mask.Last4,
-		Brand:      c.Mask.Brand,
-		IsDefault:  c.IsDefault,
-		OccurredAt: time.Now(),
-	})
+	c.emitCardBound(true)
 }
 
-// Bind 绑卡（非默认），仅发布 CardBound 事件
 func (c *SavedCard) Bind() {
+	c.emitCardBound(false)
+}
+
+func (c *SavedCard) emitCardBound(isDefault bool) {
 	c.addEvent(event.CardBound{
 		CardID:     string(c.ID),
 		UserID:     c.UserID,
 		Last4:      c.Mask.Last4,
 		Brand:      c.Mask.Brand,
-		IsDefault:  false,
+		IsDefault:  isDefault,
 		OccurredAt: time.Now(),
 	})
 }
 
-// Suspend 挂起卡（Active → Suspended）
+// ── 状态转换 ──────────────────────────────────────────────────────
+
 func (c *SavedCard) Suspend() error {
 	if c.Status != CardStatusActive {
 		return ErrInvalidStateTransition
@@ -117,7 +116,6 @@ func (c *SavedCard) Suspend() error {
 	return nil
 }
 
-// Activate 解除挂起（Suspended → Active）
 func (c *SavedCard) Activate() error {
 	if c.Status != CardStatusSuspended {
 		return ErrInvalidStateTransition
@@ -132,7 +130,6 @@ func (c *SavedCard) Activate() error {
 	return nil
 }
 
-// Delete 软删除（Active/Suspended → Deleted，终态不可逆）
 func (c *SavedCard) Delete() error {
 	if c.Status == CardStatusDeleted {
 		return ErrInvalidStateTransition
@@ -140,6 +137,7 @@ func (c *SavedCard) Delete() error {
 	c.Status = CardStatusDeleted
 	c.IsDefault = false
 	c.UpdatedAt = time.Now()
+	c.RevokeAllChannelTokens()
 	c.addEvent(event.CardDeleted{
 		CardID:     string(c.ID),
 		UserID:     c.UserID,
@@ -148,11 +146,12 @@ func (c *SavedCard) Delete() error {
 	return nil
 }
 
-// SetDefault 设为默认卡（仅 Active 状态可设）
-// 注意：usecase 负责先调用旧默认卡的 UnsetDefault，再调用本方法
 func (c *SavedCard) SetDefault() error {
 	if c.Status != CardStatusActive {
 		return ErrCardNotUsable
+	}
+	if c.IsDefault {
+		return nil
 	}
 	c.IsDefault = true
 	c.UpdatedAt = time.Now()
@@ -164,17 +163,108 @@ func (c *SavedCard) SetDefault() error {
 	return nil
 }
 
-// UnsetDefault 取消默认（由 usecase 在切换默认卡前调用旧卡）
 func (c *SavedCard) UnsetDefault() {
 	c.IsDefault = false
 	c.UpdatedAt = time.Now()
 }
 
+// ── 加密相关行为 ──────────────────────────────────────────────────
+
+// ReEncrypt 密钥轮换时用新密文替换旧密文
+func (c *SavedCard) ReEncrypt(newEncrypted EncryptedPAN) {
+	c.EncryptedPAN = newEncrypted
+	c.UpdatedAt = time.Now()
+}
+
+// RecordPANDecryption 记录 PAN 解密审计事件（PCI Req 10）
+func (c *SavedCard) RecordPANDecryption(reason string) {
+	c.addEvent(event.PANDecrypted{
+		CardID:     string(c.ID),
+		UserID:     c.UserID,
+		Reason:     reason,
+		OccurredAt: time.Now(),
+	})
+}
+
+// ── ChannelToken 行为 ─────────────────────────────────────────────
+
+// StoreChannelToken 存储渠道复购令牌，一卡一渠道一令牌，相同渠道覆盖旧 token
+func (c *SavedCard) StoreChannelToken(channel, token, shopperRef string) {
+	for i, ct := range c.ChannelTokens {
+		if ct.Channel == channel {
+			c.ChannelTokens[i].Token = token
+			c.ChannelTokens[i].ShopperRef = shopperRef
+			c.ChannelTokens[i].Status = TokenStatusActive
+			c.UpdatedAt = time.Now()
+			c.addEvent(event.ChannelTokenStored{
+				CardID:     string(c.ID),
+				Channel:    channel,
+				OccurredAt: time.Now(),
+			})
+			return
+		}
+	}
+	c.ChannelTokens = append(c.ChannelTokens, ChannelToken{
+		Channel:    channel,
+		Token:      token,
+		ShopperRef: shopperRef,
+		Status:     TokenStatusActive,
+		CreatedAt:  time.Now(),
+	})
+	c.UpdatedAt = time.Now()
+	c.addEvent(event.ChannelTokenStored{
+		CardID:     string(c.ID),
+		Channel:    channel,
+		OccurredAt: time.Now(),
+	})
+}
+
+// GetActiveChannelToken 获取指定渠道的 active token
+func (c *SavedCard) GetActiveChannelToken(channel string) *ChannelToken {
+	for i, ct := range c.ChannelTokens {
+		if ct.Channel == channel && ct.Status == TokenStatusActive {
+			return &c.ChannelTokens[i]
+		}
+	}
+	return nil
+}
+
+// RevokeChannelToken 吊销指定渠道的 token
+func (c *SavedCard) RevokeChannelToken(channel string) {
+	for i, ct := range c.ChannelTokens {
+		if ct.Channel == channel && ct.Status == TokenStatusActive {
+			c.ChannelTokens[i].Status = TokenStatusRevoked
+			c.UpdatedAt = time.Now()
+			c.addEvent(event.ChannelTokenRevoked{
+				CardID:     string(c.ID),
+				Channel:    channel,
+				OccurredAt: time.Now(),
+			})
+			return
+		}
+	}
+}
+
+// RevokeAllChannelTokens 删卡时批量吊销所有 active token
+func (c *SavedCard) RevokeAllChannelTokens() {
+	for i, ct := range c.ChannelTokens {
+		if ct.Status == TokenStatusActive {
+			c.ChannelTokens[i].Status = TokenStatusRevoked
+			c.addEvent(event.ChannelTokenRevoked{
+				CardID:     string(c.ID),
+				Channel:    ct.Channel,
+				OccurredAt: time.Now(),
+			})
+		}
+	}
+}
+
+// ── 事件基础设施 ──────────────────────────────────────────────────
+
 func (c *SavedCard) addEvent(e event.DomainEvent) {
 	c.Events = append(c.Events, e)
 }
 
-// ClearEvents 返回并清空待发布事件
 func (c *SavedCard) ClearEvents() []event.DomainEvent {
 	events := c.Events
 	c.Events = nil

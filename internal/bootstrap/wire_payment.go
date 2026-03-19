@@ -1,8 +1,9 @@
 package bootstrap
 
 import (
-	catalogPersistence "payment-demo/internal/catalog/adapter/persistence"
 	cardPersistence "payment-demo/internal/card/adapter/persistence"
+	cardApp "payment-demo/internal/card/application"
+	catalogPersistence "payment-demo/internal/catalog/adapter/persistence"
 	couponInmem "payment-demo/internal/coupon/adapter/inmem"
 	"payment-demo/internal/infra/paypal"
 	"payment-demo/internal/infra/stripe"
@@ -20,24 +21,24 @@ import (
 )
 
 // PaymentModule payment 上下文的组装产物。
-// 依赖其他 4 个上下文的 Repository（通过 ACL adapter 隔离）。
 type PaymentModule struct {
 	Handler *paymentHTTP.PaymentHandler
 }
 
 // wirePayment 组装 payment 上下文。
-// 接收各渠道共享的 infra 客户端和其他上下文共享的 Repository 指针。
 func wirePayment(
 	stripeClient *stripe.Client,
 	paypalClient *paypal.Client,
 	productRepo *catalogPersistence.InMemoryProductRepository,
 	cardRepo *cardPersistence.InMemoryCardRepository,
+	cardUC *cardApp.CardUseCase,
 	merchantRepo *merchantPersistence.InMemoryMerchantRepository,
 	couponRepo *couponInmem.InMemoryCouponRepository,
 ) *PaymentModule {
 	// ACL adapters — 实现 payment 侧消费方定义的 port 接口
 	catalogAdapter := paymentCatalog.NewCatalogAdapter(productRepo)
-	cardAdapter := paymentCard.NewCardAdapter(cardRepo)
+	cardQueryAdapter := paymentCard.NewCardAdapter(cardRepo)
+	cardCommandAdapter := paymentCard.NewCardCommandAdapter(cardUC)
 	merchantAdapter := paymentMerchant.NewMerchantAdapter(merchantRepo)
 	couponAdapter := paymentCoupon.NewCouponAdapter(couponRepo)
 
@@ -50,7 +51,7 @@ func wirePayment(
 
 	uc := paymentApp.NewChargeUseCase(
 		merchantAdapter, gatewayFactory, txnRepo,
-		catalogAdapter, cardAdapter, couponAdapter, taxQuery,
+		catalogAdapter, cardQueryAdapter, cardCommandAdapter, couponAdapter, taxQuery,
 	)
 	return &PaymentModule{
 		Handler: paymentHTTP.NewPaymentHandler(uc),

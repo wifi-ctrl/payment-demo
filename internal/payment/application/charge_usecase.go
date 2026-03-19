@@ -32,6 +32,7 @@ type ChargeUseCase struct {
 	repo             port.TransactionRepository
 	catalog          port.CatalogQuery
 	cardQuery        port.CardQuery
+	cardCommand      port.CardCommand   // 支付成功后回存 token / 绑卡
 	couponApplier    port.CouponApplier // nil = 无优惠券支持
 	taxQuery         port.TaxRateQuery  // nil = 免税
 }
@@ -44,6 +45,7 @@ func NewChargeUseCase(
 	repo port.TransactionRepository,
 	catalog port.CatalogQuery,
 	cardQuery port.CardQuery,
+	cardCommand port.CardCommand,
 	couponApplier port.CouponApplier,
 	taxQuery port.TaxRateQuery,
 ) *ChargeUseCase {
@@ -54,6 +56,7 @@ func NewChargeUseCase(
 		repo:             repo,
 		catalog:          catalog,
 		cardQuery:        cardQuery,
+		cardCommand:      cardCommand,
 		couponApplier:    couponApplier,
 		taxQuery:         taxQuery,
 	}
@@ -70,10 +73,21 @@ type PurchaseRequest struct {
 	ProductID   string
 	Token       model.CardToken // 一次性 Token（与 SavedCardID 二选一）
 	SavedCardID string          // 已保存卡 ID（与 Token 二选一，非空时优先使用）
+	SaveCard    bool            // 首次支付后是否绑卡（仅 Token 模式有效）
 	CouponCode  string          // 可选，非空时使用优惠券
 }
 
 // Purchase 卡支付购买用例。
+//
+// 复购路径（SavedCardID 非空）：
+//  1. 查已保存卡 → 匹配 ChannelToken[targetChannel]
+//  2. 有 ChannelToken → 直接用 recurring token 授权
+//  3. 无 ChannelToken → PrepareOneTimeToken 解密 PAN → 用一次性 token 授权
+//  4. 授权成功后 → StoreChannelToken 回存复购 token
+//
+// 首次路径（Token 非空）：
+//  1. 用一次性 token 授权
+//  2. SaveCard=true + 授权返回 RecurringToken → BindCardFromToken 绑卡
 func (uc *ChargeUseCase) Purchase(ctx context.Context, req PurchaseRequest) (*model.PaymentTransaction, error) {
 	if req.MerchantID == "" {
 		return nil, model.ErrMerchantRequired
@@ -91,8 +105,22 @@ func (uc *ChargeUseCase) Purchase(ctx context.Context, req PurchaseRequest) (*mo
 	log.Printf("[UseCase] Purchase: merchant=%s, user=%s, product=%s, price=%d %s",
 		req.MerchantID, req.UserID, product.Name, product.Amount, product.Currency)
 
-	// 2. 解析支付卡
+	// 2. 获取商户 CARD 渠道凭据
+	cred, err := uc.merchantQuery.FindActiveCredential(ctx, req.MerchantID, model.PaymentMethodCard)
+	if err != nil {
+		return nil, err
+	}
+	targetChannel := cred.Channel
+
+	// 3. 构建 Card Gateway
+	gateway, err := uc.gatewayFactory.BuildCardGateway(*cred)
+	if err != nil {
+		return nil, model.ErrMerchantGatewayBuildFailed
+	}
+
+	// 4. 解析支付卡 token
 	cardToken := req.Token
+	var savedCardID string
 	if req.SavedCardID != "" {
 		cardView, err := uc.cardQuery.FindActiveCard(ctx, req.SavedCardID)
 		if err != nil {
@@ -104,23 +132,29 @@ func (uc *ChargeUseCase) Purchase(ctx context.Context, req PurchaseRequest) (*mo
 		if !cardView.IsActive {
 			return nil, model.ErrCardNotUsable
 		}
-		cardToken = model.CardToken{
-			TokenID: cardView.Token,
-			Last4:   cardView.Last4,
-			Brand:   cardView.Brand,
+		savedCardID = cardView.CardID
+
+		// 匹配 ChannelToken：优先使用渠道复购 token
+		if recurringToken, ok := cardView.ChannelTokens[targetChannel]; ok {
+			cardToken = model.CardToken{
+				TokenID: recurringToken,
+				Last4:   cardView.Last4,
+				Brand:   cardView.Brand,
+			}
+			log.Printf("[UseCase] Using recurring token for channel=%s", targetChannel)
+		} else {
+			// 无 ChannelToken → PrepareOneTimeToken 降级
+			oneTimeToken, err := uc.cardCommand.PrepareOneTimeToken(ctx, cardView.CardID, req.UserID)
+			if err != nil {
+				return nil, err
+			}
+			cardToken = model.CardToken{
+				TokenID: oneTimeToken,
+				Last4:   cardView.Last4,
+				Brand:   cardView.Brand,
+			}
+			log.Printf("[UseCase] No recurring token for channel=%s, using one-time token", targetChannel)
 		}
-	}
-
-	// 3. 获取商户 CARD 渠道凭据
-	cred, err := uc.merchantQuery.FindActiveCredential(ctx, req.MerchantID, model.PaymentMethodCard)
-	if err != nil {
-		return nil, err
-	}
-
-	// 4. 构建 Card Gateway
-	gateway, err := uc.gatewayFactory.BuildCardGateway(*cred)
-	if err != nil {
-		return nil, model.ErrMerchantGatewayBuildFailed
 	}
 
 	// 5. 应用优惠券（如有）
@@ -159,7 +193,9 @@ func (uc *ChargeUseCase) Purchase(ctx context.Context, req PurchaseRequest) (*mo
 	if err != nil {
 		uc.rollbackCoupon(ctx, req.CouponCode)
 		txn.MarkFailed(err.Error())
-		_ = uc.repo.Save(ctx, txn)
+		if saveErr := uc.repo.Save(ctx, txn); saveErr != nil {
+			log.Printf("[UseCase] failed to save failed txn: %v", saveErr)
+		}
 		return txn, model.ErrAuthorizationDeclined
 	}
 
@@ -171,6 +207,9 @@ func (uc *ChargeUseCase) Purchase(ctx context.Context, req PurchaseRequest) (*mo
 		uc.rollbackCoupon(ctx, req.CouponCode)
 		return nil, err
 	}
+
+	// 11. 授权成功后：回存 ChannelToken / 绑卡
+	uc.postAuthTokenStorage(ctx, result, req, savedCardID, targetChannel)
 
 	uc.publishEvents(txn)
 	return txn, nil
@@ -380,6 +419,35 @@ func (uc *ChargeUseCase) attachAudit(txn *model.PaymentTransaction, coupon *port
 	}
 	if coupon != nil {
 		txn.CouponID = coupon.CouponID
+	}
+}
+
+func (uc *ChargeUseCase) postAuthTokenStorage(ctx context.Context, result *port.GatewayAuthResult, req PurchaseRequest, savedCardID, targetChannel string) {
+	if result.RecurringToken == "" {
+		return
+	}
+
+	if savedCardID != "" {
+		// 复购路径：回存 ChannelToken
+		if err := uc.cardCommand.StoreChannelToken(ctx, savedCardID, result.Channel, result.RecurringToken, result.ProviderRef); err != nil {
+			log.Printf("[UseCase] StoreChannelToken failed (card=%s, channel=%s): %v", savedCardID, result.Channel, err)
+		}
+		return
+	}
+
+	if req.SaveCard {
+		// 首次路径 + SaveCard：绑卡
+		cardID, err := uc.cardCommand.BindCardFromToken(ctx, port.BindFromTokenCommand{
+			CardToken:  req.Token.TokenID,
+			Channel:    result.Channel,
+			Token:      result.RecurringToken,
+			ShopperRef: result.ProviderRef,
+		})
+		if err != nil {
+			log.Printf("[UseCase] BindCardFromToken failed: %v", err)
+		} else {
+			log.Printf("[UseCase] Card bound: cardID=%s", cardID)
+		}
 	}
 }
 

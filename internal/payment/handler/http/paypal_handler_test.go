@@ -71,6 +71,18 @@ func (q *handlerStubCardQuery) FindActiveCard(_ context.Context, _ string) (*por
 	return nil, paymentModel.ErrCardNotFound
 }
 
+type handlerStubCardCommand struct{}
+
+func (c *handlerStubCardCommand) StoreChannelToken(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+func (c *handlerStubCardCommand) BindCardFromToken(_ context.Context, _ port.BindFromTokenCommand) (string, error) {
+	return "card-new", nil
+}
+func (c *handlerStubCardCommand) PrepareOneTimeToken(_ context.Context, _, _ string) (string, error) {
+	return "ct_onetime", nil
+}
+
 // ─────────────────────────────────────────────────────────────────
 // 多商户桩（Handler 测试层）
 // ─────────────────────────────────────────────────────────────────
@@ -130,7 +142,7 @@ func buildHandlerSetup(catalog *handlerStubCatalog, paypalGw *handlerStubPayPalG
 	merchantQ := &handlerMerchantQuery{cred: defaultMerchantCred()}
 	factory := &handlerGatewayFactory{cardGw: cardGw, paypalGw: paypalGw}
 
-	uc := application.NewChargeUseCase(merchantQ, factory, repo, catalog, &handlerStubCardQuery{}, nil, nil)
+	uc := application.NewChargeUseCase(merchantQ, factory, repo, catalog, &handlerStubCardQuery{}, &handlerStubCardCommand{}, nil, nil)
 	handler := paymentHTTP.NewPaymentHandler(uc)
 
 	mux := http.NewServeMux()

@@ -58,3 +58,31 @@ type DefaultCardChanged struct {
 }
 
 func (e DefaultCardChanged) EventName() string { return "card.default_changed" }
+
+// ChannelTokenStored 渠道复购令牌已存储
+type ChannelTokenStored struct {
+	CardID     string
+	Channel    string
+	OccurredAt time.Time
+}
+
+func (e ChannelTokenStored) EventName() string { return "card.channel_token_stored" }
+
+// ChannelTokenRevoked 渠道复购令牌已吊销
+type ChannelTokenRevoked struct {
+	CardID     string
+	Channel    string
+	OccurredAt time.Time
+}
+
+func (e ChannelTokenRevoked) EventName() string { return "card.channel_token_revoked" }
+
+// PANDecrypted PAN 已解密（PCI Req 10 审计事件）
+type PANDecrypted struct {
+	CardID     string
+	UserID     string
+	Reason     string
+	OccurredAt time.Time
+}
+
+func (e PANDecrypted) EventName() string { return "card.pan_decrypted" }

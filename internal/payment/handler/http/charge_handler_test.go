@@ -41,7 +41,7 @@ func buildCardChargeSetup(
 		authorizeResult: &port.PayPalAuthResult{ProviderRef: "PAYPAL-001"},
 	}
 	factory := &handlerGatewayFactory{cardGw: cardGw, paypalGw: paypalGw}
-	uc := application.NewChargeUseCase(merchantQ, factory, repo, catalog, &handlerStubCardQuery{}, nil, nil)
+	uc := application.NewChargeUseCase(merchantQ, factory, repo, catalog, &handlerStubCardQuery{}, &handlerStubCardCommand{}, nil, nil)
 	handler := paymentHTTP.NewPaymentHandler(uc)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)

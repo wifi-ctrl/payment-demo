@@ -28,7 +28,7 @@ func New(cfg *config.Config) *App {
 	// 1. 各上下文独立组装（无跨上下文依赖的先组装）
 	identity := wireIdentity()
 	catalog := wireCatalog()
-	card := wireCard(stripeClient)
+	card := wireCard()
 	merchant := wireMerchant()
 	coupon := wireCoupon()
 
@@ -38,6 +38,7 @@ func New(cfg *config.Config) *App {
 		paypalClient,
 		catalog.ProductRepo,
 		card.CardRepo,
+		card.CardUC,
 		merchant.MerchantRepo,
 		coupon.CouponRepo,
 	)

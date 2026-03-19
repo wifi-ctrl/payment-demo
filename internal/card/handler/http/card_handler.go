@@ -23,12 +23,27 @@ func NewCardHandler(uc *application.CardUseCase) *CardHandler {
 // RegisterRoutes 注册路由
 func (h *CardHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/cards", h.handleCards)              // POST（绑卡），GET（列表/详情），DELETE（删卡）
+	mux.HandleFunc("/cards/tokenize", h.handleTokenize)  // POST /cards/tokenize
 	mux.HandleFunc("/cards/suspend", h.handleSuspend)    // POST /cards/suspend
 	mux.HandleFunc("/cards/activate", h.handleActivate)  // POST /cards/activate
 	mux.HandleFunc("/cards/default", h.handleSetDefault) // POST /cards/default
 }
 
 // --- Request / Response DTOs ---
+
+type TokenizeRequest struct {
+	PAN            string `json:"pan"`
+	ExpiryMonth    int    `json:"expiry_month"`
+	ExpiryYear     int    `json:"expiry_year"`
+	CVV            string `json:"cvv"`
+	CardholderName string `json:"cardholder_name"`
+}
+
+type TokenizeResponse struct {
+	CardToken string `json:"card_token"`
+	Last4     string `json:"last4"`
+	Brand     string `json:"brand"`
+}
 
 type BindCardRequest struct {
 	OneTimeToken string `json:"one_time_token"`
@@ -78,7 +93,7 @@ func (h *CardHandler) handleCards(w http.ResponseWriter, r *http.Request) {
 
 // --- Handlers ---
 
-// POST /cards
+// POST /cards — 绑卡（需先调用 POST /cards/tokenize 获取 card_token）
 func (h *CardHandler) handleBind(w http.ResponseWriter, r *http.Request) {
 	var req BindCardRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -90,16 +105,15 @@ func (h *CardHandler) handleBind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// R-1: 通过 card/adapter/auth 读取 userID，消除 handler 层对 identity 包的直接依赖
 	userID, ok := auth.UserIDFromContext(r.Context())
 	if !ok {
 		jsonError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	_ = userID // card_token 中已含 userID
 
-	card, err := h.useCase.BindCard(r.Context(), application.BindCardRequest{
-		UserID:       userID,
-		OneTimeToken: req.OneTimeToken,
+	card, err := h.useCase.BindCardFromToken(r.Context(), application.BindFromTokenRequest{
+		CardToken: req.OneTimeToken,
 	})
 	if err != nil {
 		jsonError(w, err.Error(), mapErrorStatus(err))
@@ -174,6 +188,54 @@ func (h *CardHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	// 返回 200 + 已删除的状态信息（AC-39 验收标准）
 	jsonOK(w, map[string]string{"status": string(model.CardStatusDeleted)})
+}
+
+// POST /cards/tokenize
+func (h *CardHandler) handleTokenize(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req TokenizeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.PAN == "" {
+		jsonError(w, "pan is required", http.StatusBadRequest)
+		return
+	}
+
+	result, err := h.useCase.Tokenize(r.Context(), application.TokenizeRequest{
+		UserID:         userID,
+		PAN:            req.PAN,
+		ExpiryMonth:    req.ExpiryMonth,
+		ExpiryYear:     req.ExpiryYear,
+		CVV:            req.CVV,
+		CardholderName: req.CardholderName,
+	})
+	if err != nil {
+		jsonError(w, err.Error(), mapErrorStatus(err))
+		return
+	}
+
+	resp := TokenizeResponse{
+		Brand: string(result.Brand),
+		Last4: result.Mask.Last4,
+	}
+	if result.CardToken != nil {
+		resp.CardToken = *result.CardToken
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	jsonOK(w, resp)
 }
 
 // POST /cards/suspend with body {"card_id": "xxx"}
@@ -305,6 +367,14 @@ func mapErrorStatus(err error) int {
 		return http.StatusForbidden
 	case errors.Is(err, model.ErrVaultTokenizeFailed):
 		return http.StatusBadGateway
+	case errors.Is(err, model.ErrDuplicateCard):
+		return http.StatusConflict
+	case errors.Is(err, model.ErrEncryptionFailed),
+		errors.Is(err, model.ErrDecryptionFailed):
+		return http.StatusInternalServerError
+	case errors.Is(err, model.ErrCardTokenExpired),
+		errors.Is(err, model.ErrCardTokenInvalid):
+		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError
 	}

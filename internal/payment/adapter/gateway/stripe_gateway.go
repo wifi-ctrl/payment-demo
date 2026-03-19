@@ -41,10 +41,11 @@ func (g *StripeGatewayAdapter) Authorize(_ context.Context, token model.CardToke
 		return nil, err
 	}
 
-	// ACL 翻译：stripe.PaymentIntentResult → payment 领域 DTO
 	return &port.GatewayAuthResult{
-		ProviderRef: result.ID,
-		AuthCode:    result.AuthCode,
+		ProviderRef:    result.ID,
+		AuthCode:       result.AuthCode,
+		RecurringToken: result.RecurringToken,
+		Channel:        "stripe",
 	}, nil
 }
 

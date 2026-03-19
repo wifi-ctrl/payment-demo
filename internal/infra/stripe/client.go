@@ -95,8 +95,9 @@ type PaymentIntentParams struct {
 
 // PaymentIntentResult 创建 PaymentIntent 的响应。
 type PaymentIntentResult struct {
-	ID       string // PaymentIntent ID（ProviderRef）
-	AuthCode string // 授权码
+	ID             string // PaymentIntent ID（ProviderRef）
+	AuthCode       string // 授权码
+	RecurringToken string // 渠道返回的复购 token (pm_xxx)
 }
 
 // CaptureParams 扣款请求参数。
@@ -152,10 +153,14 @@ func (c *Client) CreatePaymentIntent(params PaymentIntentParams) (*PaymentIntent
 	if err != nil {
 		return nil, err
 	}
-	return &PaymentIntentResult{
+	result := &PaymentIntentResult{
 		ID:       resp["id"].(string),
 		AuthCode: resp["auth_code"].(string),
-	}, nil
+	}
+	if rt, ok := resp["recurring_token"].(string); ok {
+		result.RecurringToken = rt
+	}
+	return result, nil
 }
 
 // CapturePaymentIntent 调用 Stripe PaymentIntents Capture API 扣款。

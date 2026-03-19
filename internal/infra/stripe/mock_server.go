@@ -87,8 +87,9 @@ func handlePaymentIntents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]any{
-		"id":        fmt.Sprintf("pi_%s", randHex(8)),
-		"auth_code": fmt.Sprintf("AUTH_%s", randHex(3)),
+		"id":              fmt.Sprintf("pi_%s", randHex(8)),
+		"auth_code":       fmt.Sprintf("AUTH_%s", randHex(3)),
+		"recurring_token": fmt.Sprintf("pm_mock_%s", randHex(8)),
 	})
 }
 

@@ -32,6 +32,7 @@ func printRoutes() {
 	log.Println("")
 	log.Println("  Card:")
 	log.Println("    POST   /cards               - 绑卡")
+	log.Println("    POST   /cards/tokenize      - 卡令牌化（PAN → ct_token）")
 	log.Println("    GET    /cards               - 我的卡列表")
 	log.Println("    GET    /cards?id=xxx        - 卡详情")
 	log.Println("    DELETE /cards               - 删除卡")
