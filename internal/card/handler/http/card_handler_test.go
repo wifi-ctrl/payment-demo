@@ -12,7 +12,7 @@ import (
 	"payment-demo/internal/card/domain/model"
 	"payment-demo/internal/card/domain/port"
 	cardHTTP "payment-demo/internal/card/handler/http"
-	identityMW "payment-demo/internal/identity/handler/middleware"
+	"payment-demo/internal/shared/auth"
 )
 
 // ─────────────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ func setup(repo port.CardRepository, vault port.CardVault, userID string) http.H
 
 	// 用 auth.WithUserID 注入 userID，保证与 handler 中 UserIDFromContext 的 key 一致
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := identityMW.WithUserID(r.Context(), userID)
+		ctx := auth.WithUserID(r.Context(), userID)
 		mux.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

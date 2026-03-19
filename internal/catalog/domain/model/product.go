@@ -1,7 +1,12 @@
 package model
 
+import "payment-demo/internal/shared/money"
+
 // ProductID 商品唯一标识
 type ProductID string
+
+// Money 金额值对象，复用 Shared Kernel。
+type Money = money.Money
 
 // ProductStatus 商品状态
 type ProductStatus string
@@ -21,10 +26,4 @@ type Product struct {
 
 func (p *Product) IsActive() bool {
 	return p.Status == ProductStatusActive
-}
-
-// Money 金额值对象
-type Money struct {
-	Amount   int64  // 最小货币单位（cents）
-	Currency string // ISO 4217
 }

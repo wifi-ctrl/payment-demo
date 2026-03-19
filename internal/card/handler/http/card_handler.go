@@ -6,8 +6,8 @@ import (
 	"log"
 	"net/http"
 
-	"payment-demo/internal/card/adapter/auth"
 	"payment-demo/internal/card/application"
+	"payment-demo/internal/shared/auth"
 	"payment-demo/internal/card/domain/model"
 )
 

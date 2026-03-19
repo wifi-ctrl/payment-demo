@@ -39,10 +39,13 @@ type PaymentTransaction struct {
 	Method      PaymentMethod // CARD / PAYPAL，默认 CARD
 	CardToken   CardToken     // Method==CARD 时有效
 	PayPalToken PayPalToken   // Method==PAYPAL 时有效
-	Status      TransactionStatus
-	ProviderRef string // 外部支付商返回的引用 ID
-	AuthCode    string
-	FailReason  string
+	Status         TransactionStatus
+	ProviderRef    string // 外部支付商返回的引用 ID
+	AuthCode       string
+	FailReason     string
+	DiscountAmount *Money // 折扣金额（nil = 未使用定价计算）
+	TaxAmount      *Money // 税额（nil = 未使用定价计算）
+	CouponID       string       // 使用的优惠券 ID（空 = 未使用）
 	AuthorizedAt *time.Time
 	CapturedAt   *time.Time
 	RefundedAt   *time.Time
@@ -140,6 +143,22 @@ func (t *PaymentTransaction) MarkFailed(reason string) {
 
 func (t *PaymentTransaction) addEvent(e event.DomainEvent) {
 	t.Events = append(t.Events, e)
+}
+
+// ValidateCapturable 校验交易是否可扣款（须为 AUTHORIZED 状态）。
+func (t *PaymentTransaction) ValidateCapturable() error {
+	if t.Status != StatusAuthorized {
+		return ErrInvalidStateTransition
+	}
+	return nil
+}
+
+// ValidateRefundable 校验交易是否可退款（须为 CAPTURED 状态）。
+func (t *PaymentTransaction) ValidateRefundable() error {
+	if t.Status != StatusCaptured {
+		return ErrInvalidStateTransition
+	}
+	return nil
 }
 
 // ClearEvents 返回所有未发布的领域事件并清空，由 UseCase 调用后发布

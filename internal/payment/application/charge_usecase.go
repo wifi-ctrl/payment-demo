@@ -12,17 +12,19 @@ import (
 // ChargeUseCase 支付用例编排层。
 //
 // 多商户路由策略：
-//   Purchase / PayPalPurchase 入参携带 MerchantID，
-//   UseCase 先通过 MerchantQuery ACL 获取该商户对应渠道的凭据（ChannelCredentialView），
-//   再通过 GatewayFactory 按凭据动态构造 Gateway 实例，实现商户级隔离。
 //
-// 字段说明：
-//   merchantQuery:    ACL 端口，查询商户渠道凭据（由 adapter/merchant 实现）
-//   gatewayFactory:   动态构造 Gateway（由 adapter/gateway 实现，按商户凭据初始化 HTTP 客户端）
-//   captureRefunders: Capture/Refund 按 PaymentMethod 查表路由，新增支付方式只需注册（OCP）
-//   repo:             交易仓储
-//   catalog:          商品 ACL 查询端口
-//   cardQuery:        已保存卡 ACL 查询端口
+//	Purchase / PayPalPurchase 入参携带 MerchantID，
+//	UseCase 先通过 MerchantQuery ACL 获取该商户对应渠道的凭据（ChannelCredentialView），
+//	再通过 GatewayFactory 按凭据动态构造 Gateway 实例，实现商户级隔离。
+//
+// 定价计算是 Purchase 流程的固有步骤：
+//
+//	1. 查商品原价
+//	2. 如有 CouponCode → CouponApplier.Apply → 获取折扣信息
+//	3. 查税率（TaxRateQuery）
+//	4. 纯计算：原价 - 折扣 + 税
+//	5. 用 FinalAmount 创建交易
+//	6. 授权失败时 → CouponApplier.Rollback（Saga 补偿）
 type ChargeUseCase struct {
 	merchantQuery    port.MerchantQuery
 	gatewayFactory   port.GatewayFactory
@@ -30,22 +32,20 @@ type ChargeUseCase struct {
 	repo             port.TransactionRepository
 	catalog          port.CatalogQuery
 	cardQuery        port.CardQuery
+	couponApplier    port.CouponApplier // nil = 无优惠券支持
+	taxQuery         port.TaxRateQuery  // nil = 免税
 }
 
 // NewChargeUseCase 构造函数注入所有依赖。
-// captureRefunders 在此处初始化为空 map，Purchase/PayPalPurchase 执行时按商户凭据动态构建；
-// Capture/Refund 需要在调用时从仓储中恢复交易，再按 txn.Method 路由 —— 见下方说明。
-//
-// 注意：多商户场景下，Capture/Refund 须通过 GatewayFactory + 存储的凭据重建 Gateway。
-// 为保持 Demo 简洁，此处 captureRefunders 仍保留静态路由表，
-// 由 NewChargeUseCase 调用方在注入时传入"默认"Gateway（或可替换为按交易 MerchantID 动态查找）。
-// 若需完整多商户 Capture/Refund，可在交易聚合根中冗余存储 MerchantID，此处已在 transaction 扩展字段中预留。
+// couponApplier / taxQuery 可传 nil（无优惠券/免税场景）。
 func NewChargeUseCase(
 	merchantQuery port.MerchantQuery,
 	gatewayFactory port.GatewayFactory,
 	repo port.TransactionRepository,
 	catalog port.CatalogQuery,
 	cardQuery port.CardQuery,
+	couponApplier port.CouponApplier,
+	taxQuery port.TaxRateQuery,
 ) *ChargeUseCase {
 	return &ChargeUseCase{
 		merchantQuery:    merchantQuery,
@@ -54,34 +54,32 @@ func NewChargeUseCase(
 		repo:             repo,
 		catalog:          catalog,
 		cardQuery:        cardQuery,
+		couponApplier:    couponApplier,
+		taxQuery:         taxQuery,
 	}
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Card 购买（多商户版）
+// Card 购买
 // ─────────────────────────────────────────────────────────────────
 
 // PurchaseRequest 用例层入参。
-// MerchantID 必填，标识本次交易归属商户，用于路由渠道凭据。
-// SavedCardID 与 Token 二选一：
-//   - 传 SavedCardID：通过 CardQuery ACL 查询已保存卡，获取 VaultToken 构造 CardToken
-//   - 传 Token：直接使用前端一次性 Token（原有流程）
 type PurchaseRequest struct {
 	MerchantID  string
 	UserID      string
 	ProductID   string
 	Token       model.CardToken // 一次性 Token（与 SavedCardID 二选一）
 	SavedCardID string          // 已保存卡 ID（与 Token 二选一，非空时优先使用）
+	CouponCode  string          // 可选，非空时使用优惠券
 }
 
-// Purchase 卡支付购买用例：验证商户凭据 → 验证商品 → 解析卡信息 → 按商户凭据构建 Gateway → 授权 → 持久化。
+// Purchase 卡支付购买用例。
 func (uc *ChargeUseCase) Purchase(ctx context.Context, req PurchaseRequest) (*model.PaymentTransaction, error) {
-	// 1. 校验 MerchantID
 	if req.MerchantID == "" {
 		return nil, model.ErrMerchantRequired
 	}
 
-	// 2. 查商品（CatalogQuery ACL，不直接依赖 catalog 上下文）
+	// 1. 查商品
 	product, err := uc.catalog.FindProduct(ctx, req.ProductID)
 	if err != nil {
 		return nil, err
@@ -93,7 +91,7 @@ func (uc *ChargeUseCase) Purchase(ctx context.Context, req PurchaseRequest) (*mo
 	log.Printf("[UseCase] Purchase: merchant=%s, user=%s, product=%s, price=%d %s",
 		req.MerchantID, req.UserID, product.Name, product.Amount, product.Currency)
 
-	// 3. 解析支付卡：SavedCardID 非空时通过 ACL 查询已保存卡
+	// 2. 解析支付卡
 	cardToken := req.Token
 	if req.SavedCardID != "" {
 		cardView, err := uc.cardQuery.FindActiveCard(ctx, req.SavedCardID)
@@ -113,36 +111,64 @@ func (uc *ChargeUseCase) Purchase(ctx context.Context, req PurchaseRequest) (*mo
 		}
 	}
 
-	// 4. 通过 MerchantQuery ACL 获取该商户 CARD 渠道的凭据
+	// 3. 获取商户 CARD 渠道凭据
 	cred, err := uc.merchantQuery.FindActiveCredential(ctx, req.MerchantID, model.PaymentMethodCard)
 	if err != nil {
-		return nil, err // port.ErrMerchantCredentialNotFound
+		return nil, err
 	}
 
-	// 5. 按商户凭据动态构建 Card Gateway（商户级隔离）
+	// 4. 构建 Card Gateway
 	gateway, err := uc.gatewayFactory.BuildCardGateway(*cred)
 	if err != nil {
 		return nil, model.ErrMerchantGatewayBuildFailed
 	}
 
-	// 6. 创建交易
-	amount := model.NewMoney(product.Amount, product.Currency)
-	txn := model.NewPaymentTransaction(req.UserID, product.ID, amount, cardToken)
-	txn.MerchantID = req.MerchantID // 冗余存储，便于 Capture/Refund 时重建 Gateway
+	// 5. 应用优惠券（如有）
+	original := model.NewMoney(product.Amount, product.Currency)
+	var coupon *port.AppliedCoupon
+	var discountType string
+	var discountValue int64
 
-	// 7. 调商户专属 Card Gateway 授权
+	if req.CouponCode != "" && uc.couponApplier != nil {
+		coupon, err = uc.couponApplier.Apply(ctx, req.CouponCode, req.UserID)
+		if err != nil {
+			return nil, err
+		}
+		discountType = coupon.DiscountType
+		discountValue = coupon.DiscountValue
+	}
+
+	// 6. 查税率
+	taxBP := uc.queryTaxRate(ctx, req.ProductID, product.Currency)
+
+	// 7. 计算最终金额
+	finalAmount, discountAmount, taxAmount, err := service.CalculateFinalAmount(original, discountType, discountValue, taxBP)
+	if err != nil {
+		uc.rollbackCoupon(ctx, req.CouponCode)
+		return nil, err
+	}
+
+	// 8. 创建交易
+	amount := model.NewMoney(finalAmount.Amount, finalAmount.Currency)
+	txn := model.NewPaymentTransaction(req.UserID, product.ID, amount, cardToken)
+	txn.MerchantID = req.MerchantID
+	uc.attachAudit(txn, coupon, discountAmount, taxAmount)
+
+	// 9. 授权
 	result, err := gateway.Authorize(ctx, cardToken, amount)
 	if err != nil {
+		uc.rollbackCoupon(ctx, req.CouponCode)
 		txn.MarkFailed(err.Error())
 		_ = uc.repo.Save(ctx, txn)
 		return txn, model.ErrAuthorizationDeclined
 	}
 
-	// 8. 授权成功：状态转换 → 持久化 → 发布事件
+	// 10. 持久化
 	if err := txn.MarkAuthorized(result.ProviderRef, result.AuthCode); err != nil {
 		return nil, err
 	}
 	if err := uc.repo.Save(ctx, txn); err != nil {
+		uc.rollbackCoupon(ctx, req.CouponCode)
 		return nil, err
 	}
 
@@ -151,26 +177,24 @@ func (uc *ChargeUseCase) Purchase(ctx context.Context, req PurchaseRequest) (*mo
 }
 
 // ─────────────────────────────────────────────────────────────────
-// PayPal 购买（多商户版）
+// PayPal 购买
 // ─────────────────────────────────────────────────────────────────
 
 // PayPalPurchaseRequest PayPal 购买用例入参。
-// MerchantID 必填。
 type PayPalPurchaseRequest struct {
 	MerchantID string
 	UserID     string
 	ProductID  string
-	Token      model.PayPalToken // 前端 JS SDK 返回的 OrderID + PayerID
+	Token      model.PayPalToken
+	CouponCode string
 }
 
-// PayPalPurchase PayPal 购买用例：验证商户凭据 → 查商品 → 按商户凭据构建 PayPal Gateway → 授权 → 持久化。
+// PayPalPurchase PayPal 购买用例。
 func (uc *ChargeUseCase) PayPalPurchase(ctx context.Context, req PayPalPurchaseRequest) (*model.PaymentTransaction, error) {
-	// 1. 校验 MerchantID
 	if req.MerchantID == "" {
 		return nil, model.ErrMerchantRequired
 	}
 
-	// 2. 查商品
 	product, err := uc.catalog.FindProduct(ctx, req.ProductID)
 	if err != nil {
 		return nil, err
@@ -182,37 +206,57 @@ func (uc *ChargeUseCase) PayPalPurchase(ctx context.Context, req PayPalPurchaseR
 	log.Printf("[UseCase] PayPalPurchase: merchant=%s, user=%s, product=%s, price=%d %s, orderID=%s",
 		req.MerchantID, req.UserID, product.Name, product.Amount, product.Currency, req.Token.OrderID)
 
-	// 3. 通过 MerchantQuery ACL 获取该商户 PAYPAL 渠道的凭据
 	cred, err := uc.merchantQuery.FindActiveCredential(ctx, req.MerchantID, model.PaymentMethodPayPal)
 	if err != nil {
 		return nil, err
 	}
 
-	// 4. 按商户凭据动态构建 PayPal Gateway
 	paypalGateway, err := uc.gatewayFactory.BuildPayPalGateway(*cred)
 	if err != nil {
 		return nil, model.ErrMerchantGatewayBuildFailed
 	}
 
-	amount := model.NewMoney(product.Amount, product.Currency)
+	// 优惠券 + 税率 + 计算
+	original := model.NewMoney(product.Amount, product.Currency)
+	var coupon *port.AppliedCoupon
+	var discountType string
+	var discountValue int64
 
-	// 5. 创建 PayPal 交易
+	if req.CouponCode != "" && uc.couponApplier != nil {
+		coupon, err = uc.couponApplier.Apply(ctx, req.CouponCode, req.UserID)
+		if err != nil {
+			return nil, err
+		}
+		discountType = coupon.DiscountType
+		discountValue = coupon.DiscountValue
+	}
+
+	taxBP := uc.queryTaxRate(ctx, req.ProductID, product.Currency)
+
+	finalAmount, discountAmount, taxAmount, err := service.CalculateFinalAmount(original, discountType, discountValue, taxBP)
+	if err != nil {
+		uc.rollbackCoupon(ctx, req.CouponCode)
+		return nil, err
+	}
+
+	amount := model.NewMoney(finalAmount.Amount, finalAmount.Currency)
 	txn := model.NewPayPalTransaction(req.UserID, product.ID, amount, req.Token)
 	txn.MerchantID = req.MerchantID
+	uc.attachAudit(txn, coupon, discountAmount, taxAmount)
 
-	// 6. 调商户专属 PayPal Gateway 授权
 	result, err := paypalGateway.Authorize(ctx, req.Token, amount)
 	if err != nil {
+		uc.rollbackCoupon(ctx, req.CouponCode)
 		txn.MarkFailed(err.Error())
 		_ = uc.repo.Save(ctx, txn)
 		return txn, model.ErrAuthorizationDeclined
 	}
 
-	// 7. 授权成功
 	if err := txn.MarkAuthorized(result.ProviderRef, ""); err != nil {
 		return nil, err
 	}
 	if err := uc.repo.Save(ctx, txn); err != nil {
+		uc.rollbackCoupon(ctx, req.CouponCode)
 		return nil, err
 	}
 
@@ -221,16 +265,16 @@ func (uc *ChargeUseCase) PayPalPurchase(ctx context.Context, req PayPalPurchaseR
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Capture / Refund（多商户版：按存储的 MerchantID 重建 Gateway）
+// Capture / Refund
 // ─────────────────────────────────────────────────────────────────
 
-// Capture 扣款用例：恢复交易 → 按 MerchantID+Method 重建 Gateway → 扣款 → 状态转换 → 持久化。
+// Capture 扣款用例。
 func (uc *ChargeUseCase) Capture(ctx context.Context, txnID model.TransactionID) (*model.PaymentTransaction, error) {
 	txn, err := uc.repo.FindByID(ctx, txnID)
 	if err != nil {
 		return nil, err
 	}
-	if err := service.ValidateCapturable(txn); err != nil {
+	if err := txn.ValidateCapturable(); err != nil {
 		return nil, err
 	}
 
@@ -253,13 +297,13 @@ func (uc *ChargeUseCase) Capture(ctx context.Context, txnID model.TransactionID)
 	return txn, nil
 }
 
-// Refund 退款用例：恢复交易 → 按 MerchantID+Method 重建 Gateway → 退款 → 状态转换 → 持久化。
+// Refund 退款用例。
 func (uc *ChargeUseCase) Refund(ctx context.Context, txnID model.TransactionID) (*model.PaymentTransaction, error) {
 	txn, err := uc.repo.FindByID(ctx, txnID)
 	if err != nil {
 		return nil, err
 	}
-	if err := service.ValidateRefundable(txn); err != nil {
+	if err := txn.ValidateRefundable(); err != nil {
 		return nil, err
 	}
 
@@ -282,11 +326,6 @@ func (uc *ChargeUseCase) Refund(ctx context.Context, txnID model.TransactionID) 
 	return txn, nil
 }
 
-// buildCaptureRefunder 按交易的 MerchantID + Method 动态重建 Gateway（CaptureRefunder 接口）。
-// 这是多商户 Capture/Refund 的核心路由逻辑：
-//   - 从交易中读取冗余的 MerchantID（由 Purchase 时写入）
-//   - 通过 MerchantQuery 重新获取当前有效凭据
-//   - 通过 GatewayFactory 构建对应渠道的 Gateway
 func (uc *ChargeUseCase) buildCaptureRefunder(ctx context.Context, txn *model.PaymentTransaction) (port.CaptureRefunder, error) {
 	if txn.MerchantID == "" {
 		return nil, model.ErrMerchantRequired
@@ -308,12 +347,49 @@ func (uc *ChargeUseCase) buildCaptureRefunder(ctx context.Context, txn *model.Pa
 }
 
 // ─────────────────────────────────────────────────────────────────
-// 查询（不变）
+// 查询
 // ─────────────────────────────────────────────────────────────────
 
 // GetTransaction 查询交易用例。
 func (uc *ChargeUseCase) GetTransaction(ctx context.Context, txnID model.TransactionID) (*model.PaymentTransaction, error) {
 	return uc.repo.FindByID(ctx, txnID)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// helpers
+// ─────────────────────────────────────────────────────────────────
+
+func (uc *ChargeUseCase) queryTaxRate(ctx context.Context, productID, currency string) int64 {
+	if uc.taxQuery == nil {
+		return 0
+	}
+	bp, err := uc.taxQuery.FindTaxRate(ctx, productID, currency)
+	if err != nil {
+		log.Printf("[UseCase] TaxRateQuery failed (productID=%s, currency=%s): %v — using 0", productID, currency, err)
+		return 0
+	}
+	return bp
+}
+
+func (uc *ChargeUseCase) attachAudit(txn *model.PaymentTransaction, coupon *port.AppliedCoupon, discount, tax model.Money) {
+	if !discount.IsZero() {
+		txn.DiscountAmount = &discount
+	}
+	if !tax.IsZero() {
+		txn.TaxAmount = &tax
+	}
+	if coupon != nil {
+		txn.CouponID = coupon.CouponID
+	}
+}
+
+func (uc *ChargeUseCase) rollbackCoupon(ctx context.Context, couponCode string) {
+	if couponCode == "" || uc.couponApplier == nil {
+		return
+	}
+	if err := uc.couponApplier.Rollback(ctx, couponCode); err != nil {
+		log.Printf("[UseCase] coupon rollback failed: %v", err)
+	}
 }
 
 func (uc *ChargeUseCase) publishEvents(txn *model.PaymentTransaction) {

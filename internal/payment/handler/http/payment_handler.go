@@ -5,10 +5,10 @@ import (
 	"log"
 	"net/http"
 
-	"payment-demo/internal/identity/handler/middleware"
 	"payment-demo/internal/payment/application"
 	"payment-demo/internal/payment/domain/model"
 	"payment-demo/internal/payment/domain/port"
+	"payment-demo/internal/shared/auth"
 )
 
 // PaymentHandler HTTP 驱动适配器
@@ -54,6 +54,8 @@ type RefundRequest struct {
 // saved_card_id 与 token_id 二选一：
 //   - saved_card_id 非空时使用已保存卡（通过 CardQuery ACL 查询 VaultToken）
 //   - 否则使用一次性 token_id（前端 tokenization）
+//
+// coupon_code 可选：非空时查优惠券并应用折扣+税计算。
 type PurchaseRequest struct {
 	MerchantID  string `json:"merchant_id"`
 	ProductID   string `json:"product_id"`
@@ -61,31 +63,37 @@ type PurchaseRequest struct {
 	Last4       string `json:"last4,omitempty"`
 	Brand       string `json:"brand,omitempty"`
 	SavedCardID string `json:"saved_card_id,omitempty"` // 已保存卡 ID
+	CouponCode  string `json:"coupon_code,omitempty"`   // 优惠券码（可选）
 }
 
 // PayPalPurchaseRequest PayPal 购买请求。
 // merchant_id 必填。
 // order_id / payer_id 均由前端 PayPal JS SDK tokenization 后返回。
+// coupon_code 可选：非空时查优惠券并应用折扣+税计算。
 type PayPalPurchaseRequest struct {
 	MerchantID string `json:"merchant_id"`
 	ProductID  string `json:"product_id"`
-	OrderID    string `json:"order_id"` // PayPal JS SDK 返回的 Order ID
-	PayerID    string `json:"payer_id"` // PayPal JS SDK 返回的 Payer ID
+	OrderID    string `json:"order_id"`               // PayPal JS SDK 返回的 Order ID
+	PayerID    string `json:"payer_id"`                // PayPal JS SDK 返回的 Payer ID
+	CouponCode string `json:"coupon_code,omitempty"`   // 优惠券码（可选）
 }
 
 // TransactionResponse 交易响应（Card 与 PayPal 共用，method 字段区分）
 type TransactionResponse struct {
-	ID          string `json:"id"`
-	MerchantID  string `json:"merchant_id,omitempty"`
-	UserID      string `json:"user_id"`
-	ProductID   string `json:"product_id"`
-	Amount      int64  `json:"amount"`
-	Currency    string `json:"currency"`
-	Method      string `json:"method"`
-	Status      string `json:"status"`
-	ProviderRef string `json:"provider_ref,omitempty"`
-	AuthCode    string `json:"auth_code,omitempty"`
-	FailReason  string `json:"fail_reason,omitempty"`
+	ID             string `json:"id"`
+	MerchantID     string `json:"merchant_id,omitempty"`
+	UserID         string `json:"user_id"`
+	ProductID      string `json:"product_id"`
+	Amount         int64  `json:"amount"`
+	Currency       string `json:"currency"`
+	Method         string `json:"method"`
+	Status         string `json:"status"`
+	ProviderRef    string `json:"provider_ref,omitempty"`
+	AuthCode       string `json:"auth_code,omitempty"`
+	FailReason     string `json:"fail_reason,omitempty"`
+	DiscountAmount *int64 `json:"discount_amount,omitempty"` // 折扣金额
+	TaxAmount      *int64 `json:"tax_amount,omitempty"`      // 税额
+	CouponID       string `json:"coupon_id,omitempty"`       // 使用的优惠券 ID
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -115,18 +123,19 @@ func (h *PaymentHandler) handleCharge(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// userID 来自 identity 的 auth middleware，通过 ctx 传递
-	userID, ok := middleware.UserIDFromContext(r.Context())
+	userID, ok := auth.UserIDFromContext(r.Context())
 	if !ok {
 		jsonError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	txn, err := h.useCase.Purchase(r.Context(), application.PurchaseRequest{
-		MerchantID:  req.MerchantID,
-		UserID:      userID,
-		ProductID:   req.ProductID,
+		MerchantID:    req.MerchantID,
+		UserID:        userID,
+		ProductID:     req.ProductID,
 		Token:       model.CardToken{TokenID: req.TokenID, Last4: req.Last4, Brand: req.Brand},
 		SavedCardID: req.SavedCardID,
+		CouponCode:  req.CouponCode,
 	})
 	if err != nil {
 		jsonError(w, err.Error(), mapErrorStatus(err))
@@ -162,17 +171,18 @@ func (h *PaymentHandler) handlePayPalCharge(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	userID, ok := middleware.UserIDFromContext(r.Context())
+	userID, ok := auth.UserIDFromContext(r.Context())
 	if !ok {
 		jsonError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	txn, err := h.useCase.PayPalPurchase(r.Context(), application.PayPalPurchaseRequest{
-		MerchantID: req.MerchantID,
-		UserID:     userID,
-		ProductID:  req.ProductID,
+		MerchantID:    req.MerchantID,
+		UserID:        userID,
+		ProductID:     req.ProductID,
 		Token:      model.PayPalToken{OrderID: req.OrderID, PayerID: req.PayerID},
+		CouponCode: req.CouponCode,
 	})
 	if err != nil {
 		jsonError(w, err.Error(), mapErrorStatus(err))
@@ -258,7 +268,7 @@ func (h *PaymentHandler) handleGetTransaction(w http.ResponseWriter, r *http.Req
 // ─────────────────────────────────────────────────────────────────
 
 func toResponse(txn *model.PaymentTransaction) TransactionResponse {
-	return TransactionResponse{
+	resp := TransactionResponse{
 		ID:          string(txn.ID),
 		MerchantID:  txn.MerchantID,
 		UserID:      txn.UserID,
@@ -270,7 +280,15 @@ func toResponse(txn *model.PaymentTransaction) TransactionResponse {
 		ProviderRef: txn.ProviderRef,
 		AuthCode:    txn.AuthCode,
 		FailReason:  txn.FailReason,
+		CouponID:    txn.CouponID,
 	}
+	if txn.DiscountAmount != nil {
+		resp.DiscountAmount = &txn.DiscountAmount.Amount
+	}
+	if txn.TaxAmount != nil {
+		resp.TaxAmount = &txn.TaxAmount.Amount
+	}
+	return resp
 }
 
 // mapErrorStatus 错误 → HTTP 状态码映射，统一管理。

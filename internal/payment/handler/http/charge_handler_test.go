@@ -18,7 +18,7 @@ import (
 	"strings"
 	"testing"
 
-	"payment-demo/internal/identity/handler/middleware"
+	"payment-demo/internal/shared/auth"
 	"payment-demo/internal/payment/adapter/persistence"
 	"payment-demo/internal/payment/application"
 	paymentModel "payment-demo/internal/payment/domain/model"
@@ -41,7 +41,7 @@ func buildCardChargeSetup(
 		authorizeResult: &port.PayPalAuthResult{ProviderRef: "PAYPAL-001"},
 	}
 	factory := &handlerGatewayFactory{cardGw: cardGw, paypalGw: paypalGw}
-	uc := application.NewChargeUseCase(merchantQ, factory, repo, catalog, &handlerStubCardQuery{})
+	uc := application.NewChargeUseCase(merchantQ, factory, repo, catalog, &handlerStubCardQuery{}, nil, nil)
 	handler := paymentHTTP.NewPaymentHandler(uc)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
@@ -50,7 +50,7 @@ func buildCardChargeSetup(
 
 // withCardAuth 附加认证到请求（Card 测试专用命名，避免与 withAuth 混淆）
 func withCardAuth(r *http.Request, userID string) *http.Request {
-	ctx := middleware.WithUserID(r.Context(), userID)
+	ctx := auth.WithUserID(r.Context(), userID)
 	return r.WithContext(ctx)
 }
 

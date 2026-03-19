@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"payment-demo/internal/identity/handler/middleware"
+	"payment-demo/internal/shared/auth"
 	"payment-demo/internal/payment/adapter/persistence"
 	"payment-demo/internal/payment/application"
 	paymentModel "payment-demo/internal/payment/domain/model"
@@ -130,7 +130,7 @@ func buildHandlerSetup(catalog *handlerStubCatalog, paypalGw *handlerStubPayPalG
 	merchantQ := &handlerMerchantQuery{cred: defaultMerchantCred()}
 	factory := &handlerGatewayFactory{cardGw: cardGw, paypalGw: paypalGw}
 
-	uc := application.NewChargeUseCase(merchantQ, factory, repo, catalog, &handlerStubCardQuery{})
+	uc := application.NewChargeUseCase(merchantQ, factory, repo, catalog, &handlerStubCardQuery{}, nil, nil)
 	handler := paymentHTTP.NewPaymentHandler(uc)
 
 	mux := http.NewServeMux()
@@ -147,7 +147,7 @@ func buildHandlerSetup(catalog *handlerStubCatalog, paypalGw *handlerStubPayPalG
 
 // withAuth 在请求 context 中注入 userID（模拟 AuthMiddleware 效果）
 func withAuth(r *http.Request, userID string) *http.Request {
-	ctx := middleware.WithUserID(r.Context(), userID)
+	ctx := auth.WithUserID(r.Context(), userID)
 	return r.WithContext(ctx)
 }
 

@@ -1,23 +1,17 @@
 package middleware
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
 
 	"payment-demo/internal/identity/application"
+	"payment-demo/internal/shared/auth"
 )
 
-type contextKey string
-
-const userIDKey contextKey = "user_id"
-
-// UserIDFromContext 从 context 中取出认证后的用户 ID
-func UserIDFromContext(ctx context.Context) (string, bool) {
-	id, ok := ctx.Value(userIDKey).(string)
-	return id, ok
-}
+// UserIDFromContext 从 context 中取出认证后的用户 ID。
+// 委托给 shared/auth，保持向后兼容。
+var UserIDFromContext = auth.UserIDFromContext
 
 // AuthMiddleware 认证中间件
 // 依赖 identity 上下文的 AuthUseCase
@@ -44,7 +38,7 @@ func (m *AuthMiddleware) Handle(next http.Handler) http.Handler {
 		}
 
 		// 只往 ctx 写 userID（string），不泄漏 identity 的领域模型
-		ctx := context.WithValue(r.Context(), userIDKey, string(user.ID))
+		ctx := auth.WithUserID(r.Context(), string(user.ID))
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

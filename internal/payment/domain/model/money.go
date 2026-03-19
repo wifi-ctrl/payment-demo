@@ -1,21 +1,11 @@
 package model
 
-import "fmt"
+import "payment-demo/internal/shared/money"
 
-// Money 金额值对象，不可变
-type Money struct {
-	Amount   int64  // 最小货币单位（如 cents）
-	Currency string // ISO 4217，如 "USD"
-}
+// Money 金额值对象，复用 Shared Kernel（type alias，与 money.Money 同一类型）。
+type Money = money.Money
 
+// NewMoney 构造 Money 值对象。
 func NewMoney(amount int64, currency string) Money {
-	return Money{Amount: amount, Currency: currency}
-}
-
-func (m Money) String() string {
-	return fmt.Sprintf("%d %s", m.Amount, m.Currency)
-}
-
-func (m Money) GreaterThan(other Money) bool {
-	return m.Amount > other.Amount
+	return money.NewMoney(amount, currency)
 }
