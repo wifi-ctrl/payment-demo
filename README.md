@@ -768,9 +768,9 @@ curl -X POST localhost:8080/orders \
 | 方法 | 路径 | Body |
 |---|---|---|
 | POST | `/orders` | `{"merchant_id","product_id","coupon_code?","payment_method","token_id"或"saved_card_id","last4?","brand?","save_card?"}`（需登录；查商品+定价+发起支付授权） |
-| POST | `/orders/{id}/capture` | —（需登录，通过订单 ID 扣款） |
-| POST | `/orders/{id}/refund` | —（需登录，通过订单 ID 退款） |
-| GET | `/orders/{id}` | 查询订单（需登录，含定价明细 + 交易状态） |
+| GET | `/orders?id=xxx` | 查询订单（需登录，含定价明细 + 交易状态） |
+| POST | `/orders/capture` | `{"order_id":"xxx"}`（需登录，扣款） |
+| POST | `/orders/refund` | `{"order_id":"xxx"}`（需登录，退款） |
 
 ### Payment（内部）
 | 方法 | 路径 | Body |

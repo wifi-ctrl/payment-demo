@@ -3,8 +3,6 @@ package http
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
-
 
 	"payment-demo/internal/order/application"
 	"payment-demo/internal/order/domain/model"
@@ -21,8 +19,9 @@ func NewOrderHandler(uc *application.OrderUseCase) *OrderHandler {
 }
 
 func (h *OrderHandler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/orders", h.handleCreateOrder)
-	mux.HandleFunc("/orders/", h.handleOrderAction)
+	mux.HandleFunc("/orders", h.handleOrders)
+	mux.HandleFunc("/orders/capture", h.handleCapture)
+	mux.HandleFunc("/orders/refund", h.handleRefund)
 }
 
 // ── Request / Response DTOs ────────────────────────────────────
@@ -59,11 +58,19 @@ type OrderResponse struct {
 
 // ── Handlers ───────────────────────────────────────────────────
 
-func (h *OrderHandler) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+// handleOrders POST /orders（创建）、GET /orders?id=xxx（查询）
+func (h *OrderHandler) handleOrders(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		h.createOrder(w, r)
+	case http.MethodGet:
+		h.getOrder(w, r)
+	default:
 		httputil.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
 	}
+}
+
+func (h *OrderHandler) createOrder(w http.ResponseWriter, r *http.Request) {
 	var req CreateOrderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httputil.Error(w, "invalid request body", http.StatusBadRequest)
@@ -117,58 +124,75 @@ func (h *OrderHandler) handleCreateOrder(w http.ResponseWriter, r *http.Request)
 	httputil.OK(w, toResponse(order))
 }
 
-func (h *OrderHandler) handleOrderAction(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/orders/")
-	parts := strings.SplitN(path, "/", 2)
-	orderID := parts[0]
+func (h *OrderHandler) getOrder(w http.ResponseWriter, r *http.Request) {
+	orderID := r.URL.Query().Get("id")
 	if orderID == "" {
-		httputil.Error(w, "order id is required", http.StatusBadRequest)
+		httputil.Error(w, "id query parameter is required", http.StatusBadRequest)
 		return
 	}
-
 	userID, ok := auth.UserIDFromContext(r.Context())
 	if !ok {
 		httputil.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-
-	if len(parts) == 1 {
-		if r.Method != http.MethodGet {
-			httputil.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		order, err := h.useCase.GetOrder(r.Context(), userID, model.OrderID(orderID))
-		if err != nil {
-			httputil.UseCaseError(w, err, mapErrorStatus)
-			return
-		}
-		httputil.OK(w, toResponse(order))
+	order, err := h.useCase.GetOrder(r.Context(), userID, model.OrderID(orderID))
+	if err != nil {
+		httputil.UseCaseError(w, err, mapErrorStatus)
 		return
 	}
+	httputil.OK(w, toResponse(order))
+}
 
-	action := parts[1]
+// handleCapture POST /orders/capture {"order_id":"xxx"}
+func (h *OrderHandler) handleCapture(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		httputil.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	switch action {
-	case "capture":
-		order, err := h.useCase.CaptureOrder(r.Context(), userID, model.OrderID(orderID))
-		if err != nil {
-			httputil.UseCaseError(w, err, mapErrorStatus)
-			return
-		}
-		httputil.OK(w, toResponse(order))
-	case "refund":
-		order, err := h.useCase.RefundOrder(r.Context(), userID, model.OrderID(orderID))
-		if err != nil {
-			httputil.UseCaseError(w, err, mapErrorStatus)
-			return
-		}
-		httputil.OK(w, toResponse(order))
-	default:
-		httputil.Error(w, "unknown action", http.StatusNotFound)
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		httputil.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
 	}
+	var body struct {
+		OrderID string `json:"order_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.OrderID == "" {
+		httputil.Error(w, "order_id is required", http.StatusBadRequest)
+		return
+	}
+	order, err := h.useCase.CaptureOrder(r.Context(), userID, model.OrderID(body.OrderID))
+	if err != nil {
+		httputil.UseCaseError(w, err, mapErrorStatus)
+		return
+	}
+	httputil.OK(w, toResponse(order))
+}
+
+// handleRefund POST /orders/refund {"order_id":"xxx"}
+func (h *OrderHandler) handleRefund(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		httputil.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		httputil.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		OrderID string `json:"order_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.OrderID == "" {
+		httputil.Error(w, "order_id is required", http.StatusBadRequest)
+		return
+	}
+	order, err := h.useCase.RefundOrder(r.Context(), userID, model.OrderID(body.OrderID))
+	if err != nil {
+		httputil.UseCaseError(w, err, mapErrorStatus)
+		return
+	}
+	httputil.OK(w, toResponse(order))
 }
 
 // ── Helpers ────────────────────────────────────────────────────

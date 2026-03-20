@@ -70,9 +70,9 @@ order/
 | 方法 | 路径 | 用途 |
 |------|------|------|
 | `POST` | `/orders` | 创建订单（编排定价 → 创建 Order → 调 Acquiring 授权） |
-| `GET` | `/orders/{id}` | 查询订单详情 |
-| `POST` | `/orders/{id}/capture` | 扣款（调 Acquiring Capture → 绑卡） |
-| `POST` | `/orders/{id}/refund` | 退款（调 Acquiring Refund） |
+| `GET` | `/orders?id=xxx` | 查询订单详情 |
+| `POST` | `/orders/capture` | 扣款 `{"order_id":"xxx"}`（调 Acquiring Capture → 绑卡） |
+| `POST` | `/orders/refund` | 退款 `{"order_id":"xxx"}`（调 Acquiring Refund） |
 
 ## 状态机
 

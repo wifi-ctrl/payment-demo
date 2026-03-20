@@ -1262,7 +1262,7 @@ payment-demo/
 │   │   │   ├── coupon/                           #   CouponAdapter（ACL: coupon → order port）
 │   │   │   ├── tax/                              #   StaticTaxQuery
 │   │   │   └── acquiring/                        #   AcquiringAdapter（ACL: acquiring → order port）
-│   │   └── handler/http/                         #   OrderHandler（POST /orders, /orders/{id}/capture...）
+│   │   └── handler/http/                         #   OrderHandler（POST /orders, /orders/capture, /orders/refund）
 │   │
 │   ├── shared/                                   # ─── Shared Kernel ───
 │   │   ├── money/                                #   Money 值对象（int64 + Currency）
