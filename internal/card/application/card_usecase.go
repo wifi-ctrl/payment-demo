@@ -96,6 +96,55 @@ func (uc *CardUseCase) Tokenize(ctx context.Context, req TokenizeRequest) (*port
 	}, nil
 }
 
+// ResolveForGatewayResult 支付 Authorize 前由 card 服务返回的权威卡信息 + 网关 token
+type ResolveForGatewayResult struct {
+	Last4        string
+	Brand        string
+	GatewayToken string
+}
+
+// ResolveCardForGateway 校验 ct_* 归属，从 vault 取密文并解密 PAN，写入新的 RawPAN 临时 token 供网关使用。
+// 原始 ct_* 不消费，留给 Capture 后 BindCardFromToken。
+// 若缓存条目已是 RawPAN 形态（如 PrepareOneTimeToken），则直接复用同一 token。
+func (uc *CardUseCase) ResolveCardForGateway(ctx context.Context, cardToken, userID string) (*ResolveForGatewayResult, error) {
+	cached, err := uc.vault.PeekCachedCard(ctx, cardToken, userID)
+	if err != nil {
+		return nil, err
+	}
+	last4 := cached.Mask.Last4
+	brand := cached.Mask.Brand
+
+	if cached.RawPAN != "" {
+		return &ResolveForGatewayResult{
+			Last4:        last4,
+			Brand:        brand,
+			GatewayToken: cardToken,
+		}, nil
+	}
+	if len(cached.EncryptedPAN.Ciphertext) == 0 {
+		return nil, model.ErrCardTokenInvalid
+	}
+	pan, err := uc.encryption.DecryptPAN(cached.EncryptedPAN)
+	if err != nil {
+		return nil, model.ErrDecryptionFailed
+	}
+	gwTok, err := uc.vault.CacheTokenizedCard(ctx, port.CachedCardData{
+		RawPAN:  pan,
+		PANHash: cached.PANHash,
+		Mask:    cached.Mask,
+		Holder:  cached.Holder,
+		UserID:  cached.UserID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &ResolveForGatewayResult{
+		Last4:        last4,
+		Brand:        brand,
+		GatewayToken: gwTok,
+	}, nil
+}
+
 // ── 支付成功后绑卡 ──────────────────────────────────────────────
 
 // BindFromTokenRequest 从临时 token 创建持久化卡
@@ -120,6 +169,7 @@ func (uc *CardUseCase) BindCardFromToken(ctx context.Context, req BindFromTokenR
 			if saveErr := uc.repo.Save(ctx, existing); saveErr != nil {
 				log.Printf("[CardUseCase] BindCardFromToken: channel_token save failed (card=%s, channel=%s): %v",
 					existing.ID, req.Channel, saveErr)
+				return nil, saveErr
 			}
 		}
 		return existing, nil
@@ -300,6 +350,6 @@ func (uc *CardUseCase) findOwnedCard(ctx context.Context, userID string, cardID 
 
 func (uc *CardUseCase) publishEvents(card *model.SavedCard) {
 	for _, evt := range card.ClearEvents() {
-		log.Printf("[DomainEvent] %s: %+v", evt.EventName(), evt)
+		log.Printf("[DomainEvent] %s: %s", evt.EventName(), evt)
 	}
 }

@@ -52,9 +52,9 @@ internal/
 ├── identity/      用户认证 — Session 管理、AuthMiddleware、UserID 注入 ctx
 ├── catalog/       商品目录 — 商品 CRUD、上下架
 ├── card/          卡管理   — 绑卡（Vault tokenization）、挂起/激活/删除、默认卡切换
-├── merchant/      商户管理 — 商户注册/暂停、渠道凭据（CARD/PAYPAL）添加/吊销
+├── acquiring/     收单     — 商户管理 + 支付引擎（合并原 merchant + payment）
 ├── coupon/        优惠券   — 创建、核销（Apply/Rollback 补偿）、用尽/过期状态机
-├── payment/       支付核心 — Card/PayPal 购买 → 授权 → 扣款 → 退款
+├── order/         订单核心 — 创建订单（查商品+定价+发起支付授权）→ 扣款 → 退款
 └── shared/        Shared Kernel（见下文）
 ```
 
@@ -63,12 +63,12 @@ internal/
 | 标准 | 示例 |
 |---|---|
 | **独立生命周期** | 优惠券策略变更时，卡管理代码不需要改 |
-| **独立不变式** | merchant 维护"同渠道最多一个 ACTIVE 凭据"，payment 维护"CREATED → AUTHORIZED → CAPTURED"状态机 |
+| **独立不变式** | acquiring 维护"同渠道最多一个 ACTIVE 凭据"和交易级状态机，order 维护"PENDING → AUTHORIZED → CAPTURED"订单状态机 |
 | **独立变更频率** | catalog 稳定，coupon 频繁迭代 |
 
 **同一个词在不同上下文中含义不同：**
 
-| 术语 | payment 上下文 | card 上下文 |
+| 术语 | acquiring 上下文 | card 上下文 |
 |---|---|---|
 | Token | 一次性支付令牌（`CardToken`），授权后即废 | Vault 持久令牌（`VaultToken`），长期存储 |
 | Status | 交易状态：CREATED/AUTHORIZED/CAPTURED/REFUNDED/FAILED | 卡状态：ACTIVE/SUSPENDED/DELETED |
@@ -80,20 +80,20 @@ internal/
 上下文之间如何协作？本 Demo 使用三种关系模式：
 
 ```
-┌──────────┐  ACL   ┌──────────┐  ACL   ┌──────────┐
-│ merchant │◀───────│          │───────▶│ catalog  │
-└──────────┘        │          │        └──────────┘
-                    │ payment  │
-┌──────────┐  ACL   │ (下游/   │  ACL   ┌──────────┐
-│   card   │◀───────│  消费方)  │───────▶│  coupon  │
-└──────────┘        │          │        └──────────┘
-                    └────┬─────┘
-                         │ ACL
-                         ▼
-                  ┌──────────────┐
-                  │ 外部网关      │
-                  │ Stripe/PayPal│
-                  └──────────────┘
+                    ┌──────────┐  ACL   ┌──────────┐
+                    │          │───────▶│ catalog  │
+                    │  order   │        └──────────┘
+                    │ (编排层/  │  ACL   ┌──────────┐
+┌──────────┐  ACL   │  消费方)  │───────▶│  coupon  │
+│   card   │◀───────│          │        └──────────┘
+└──────────┘        └────┬─────┘
+      ▲                  │ 调用 acquiring（进程内）
+      │                  ▼
+      │ ACL    ┌────────────────┐
+      └────────│   acquiring    │  ACL   ┌──────────────┐
+               │(商户+支付引擎)  │───────▶│ 外部网关      │
+               └────────────────┘        │ Stripe/PayPal│
+                                         └──────────────┘
 
 ┌──────────┐  Shared Kernel  ┌──────────┐
 │  所有     │◀──────────────▶│ shared/  │
@@ -104,9 +104,9 @@ internal/
 
 | 关系模式 | 本项目实例 | DDD 含义 |
 |---|---|---|
-| **防腐层 (ACL)** | payment 通过 `adapter/merchant/` 访问 merchant 上下文 | 下游定义自己的接口，通过 adapter 翻译上游模型，防止上游变更污染自身领域 |
+| **防腐层 (ACL)** | order 通过 `adapter/payment/` 调用 acquiring 引擎，acquiring 通过 `adapter/card/` 访问 card 上下文 | 下游定义自己的接口，通过 adapter 翻译上游模型，防止上游变更污染自身领域 |
 | **Shared Kernel** | `shared/money`、`shared/event`、`shared/auth` | 多个上下文共同拥有的一小部分模型，变更需所有消费方同意 |
-| **消费方驱动契约** | payment 定义 `port.CatalogQuery`，而非 catalog 提供接口 | 接口由消费方按自身最小需求定义（接口隔离原则） |
+| **消费方驱动契约** | order 定义 `port.CatalogQuery`，而非 catalog 提供接口 | 接口由消费方按自身最小需求定义（接口隔离原则） |
 
 ## Shared Kernel
 
@@ -121,7 +121,7 @@ internal/
 **Go 落地技巧 — type alias 消除类型分裂：**
 
 ```go
-// payment/domain/model/money.go
+// acquiring/domain/model/money.go
 // 不重新定义 struct，用 type alias 确保与 shared/money.Money 是同一类型
 type Money = money.Money
 ```
@@ -141,7 +141,7 @@ type Money = money.Money
 ### PaymentTransaction — 支付交易
 
 ```go
-// internal/payment/domain/model/transaction.go
+// internal/acquiring/domain/model/transaction.go
 
 type PaymentTransaction struct {
     ID          TransactionID
@@ -257,8 +257,8 @@ func (m Money) MultiplyBasisPoint(bp int64) (Money, error) { ... }
 | 值对象 | 上下文 | 特征 |
 |---|---|---|
 | `Money` | shared | Amount + Currency，封装货币运算 |
-| `CardToken` | payment | TokenID + Last4 + Brand，一次性支付令牌 |
-| `PayPalToken` | payment | OrderID + PayerID |
+| `CardToken` | acquiring | TokenID + Last4 + Brand，一次性支付令牌 |
+| `PayPalToken` | acquiring | OrderID + PayerID |
 | `VaultToken` | card | Token + Provider，Vault 持久令牌 |
 | `CardMask` | card | Last4 + Brand + ExpireMonth/Year，脱敏展示 |
 | `CardHolder` | card | Name + BillingCountry |
@@ -276,7 +276,7 @@ type DomainEvent interface {
     EventName() string
 }
 
-// internal/payment/domain/event/event.go — 支付领域的具体事件
+// internal/acquiring/domain/event/payment_event.go — 支付领域的具体事件
 type PaymentAuthorized struct {
     TransactionID string
     Amount        int64
@@ -314,9 +314,9 @@ func (uc *ChargeUseCase) Capture(ctx context.Context, txnID TransactionID) {
 
 | 上下文 | 事件 | 触发时机 |
 |---|---|---|
-| payment | `PaymentAuthorized` / `PaymentCaptured` / `PaymentRefunded` | 交易状态流转 |
+| acquiring | `PaymentAuthorized` / `PaymentCaptured` / `PaymentRefunded` | 交易状态流转 |
+| acquiring | `MerchantRegistered` / `MerchantSuspended` / `CredentialAdded` / `CredentialRevoked` | 商户操作 |
 | card | `CardBound` / `CardSuspended` / `CardActivated` / `CardDeleted` / `DefaultCardChanged` | 卡状态变更 |
-| merchant | `MerchantRegistered` / `MerchantSuspended` / `CredentialAdded` / `CredentialRevoked` | 商户操作 |
 | coupon | `CouponApplied` | 优惠券核销 |
 
 ## 领域服务（Domain Service）
@@ -330,7 +330,7 @@ func (uc *ChargeUseCase) Capture(ctx context.Context, txnID TransactionID) {
 | **UseCase** | 编排（调用多个端口和聚合根方法） | `Purchase()` 流程 |
 
 ```go
-// internal/payment/domain/service/price_calculator.go
+// internal/order/domain/service/price_calculator.go
 // 纯函数：原价 - 折扣 + 税 = 最终金额
 // 不依赖任何外部服务，不修改任何状态 → 领域服务
 func CalculateFinalAmount(
@@ -371,53 +371,42 @@ func (r *InMemoryTransactionRepository) FindByID(...) (*model.PaymentTransaction
 | 类型 | 端口 | 适配器 | 说明 |
 |---|---|---|---|
 | **驱动端口** | HTTP handler 就是驱动适配器本身 | `handler/http/` | 外部请求驱动系统 |
-| **被驱动端口** | `port.TransactionRepository` | `adapter/persistence/memory_repo.go` | 系统驱动外部存储 |
-| | `port.GatewayFactory` | `adapter/gateway/stripe_gateway_factory.go` | 多渠道网关工厂（Card → Stripe, PayPal → PayPal） |
-| | `port.PaymentGateway` | `adapter/gateway/stripe_gateway.go` | Card 支付网关（Stripe PaymentIntents API） |
-| | `port.PayPalGateway` | `adapter/gateway/paypal_gateway_adapter.go` | PayPal 支付网关（PayPal Orders API） |
-| | `port.TaxRateQuery` | `adapter/tax/static_tax_query.go` | 税率查询（演示用静态配置） |
-| | `port.CatalogQuery` | `adapter/catalog/catalog_adapter.go` | 跨上下文 ACL |
-| | `port.MerchantQuery` | `adapter/merchant/merchant_adapter.go` | 跨上下文 ACL |
-| | `port.CardQuery` | `adapter/card/card_adapter.go` | 跨上下文 ACL |
-| | `port.CouponApplier` | `adapter/coupon/coupon_adapter.go` | 跨上下文 ACL |
-| | `port.CardVault` | `adapter/vault/stripe_vault.go` | 外部 Vault 服务（Stripe Tokens API） |
+| **被驱动端口** | `port.TransactionRepository` | `acquiring/adapter/persistence/` | 系统驱动外部存储 |
+| | `port.MerchantRepository` | `acquiring/adapter/persistence/` | 商户仓储（acquiring 内部） |
+| | `port.GatewayFactory` | `acquiring/adapter/gateway/factory.go` | 多渠道网关工厂 |
+| | `port.PaymentGateway` | `acquiring/adapter/gateway/stripe/` | Card 支付网关 |
+| | `port.PayPalGateway` | `acquiring/adapter/gateway/paypal/` | PayPal 支付网关 |
+| | `port.CardQuery` | `acquiring/adapter/card/` | 跨上下文 ACL → card |
+| | `port.CatalogQuery` | `order/adapter/catalog/` | 跨上下文 ACL → catalog |
+| | `port.CouponApplier` | `order/adapter/coupon/` | 跨上下文 ACL → coupon |
+| | `port.CardVault` | `card/adapter/vault/` | 外部 Vault 服务 |
 
-**关键原则：端口由消费方定义。** Payment 定义 `port.CatalogQuery`（只含 `FindProduct`），而非 Catalog 提供一个大而全的接口给别人用。
+**关键原则：端口由消费方定义。** Order 定义 `port.CatalogQuery`（只含 `FindProduct`），而非 Catalog 提供一个大而全的接口给别人用。
 
 ## 用例编排层（Application Service）
 
 UseCase **只做编排，不做业务判断**。它是端口和聚合根方法的"胶水"：
 
 ```go
-// internal/payment/application/charge_usecase.go
+// internal/acquiring/application/charge_usecase.go
 func (uc *ChargeUseCase) Purchase(ctx context.Context, req PurchaseRequest) (*model.PaymentTransaction, error) {
-    // 1. 调端口：查商品价格
-    product, _ := uc.catalog.FindProduct(ctx, req.ProductID)
-
-    // 2. 调端口：查商户凭据 → 构建网关
-    cred, _ := uc.merchantQuery.FindActiveCredential(ctx, req.MerchantID, model.PaymentMethodCard)
+    // 1. 内部查商户凭据 → 构建网关
+    cred, _ := uc.findActiveCredential(ctx, req.MerchantID, model.PaymentMethodCard)
     gateway, _ := uc.gatewayFactory.BuildCardGateway(*cred)
 
-    // 3. 调端口：应用优惠券（可选）
-    coupon, _ := uc.couponApplier.Apply(ctx, req.CouponCode, req.UserID)
+    // 2. 调聚合根工厂：创建交易（金额由 Order 上下文传入）
+    txn := model.NewPaymentTransaction(req.UserID, req.OrderID, req.Amount, cardToken)
 
-    // 4. 调领域服务：计算最终金额
-    finalAmount, _, _, _ := service.CalculateFinalAmount(original, discountType, discountValue, taxBP)
-
-    // 5. 调聚合根工厂：创建交易
-    txn := model.NewPaymentTransaction(req.UserID, product.ID, finalAmount, cardToken)
-
-    // 6. 调端口（网关）：授权
-    result, err := gateway.Authorize(ctx, cardToken, finalAmount)
+    // 3. 调端口（网关）：授权
+    result, err := gateway.Authorize(ctx, gatewayToken, req.Amount)
     if err != nil {
-        uc.couponApplier.Rollback(ctx, req.CouponCode)  // Saga 补偿
         txn.MarkFailed(err.Error())
     }
 
-    // 7. 调聚合根方法：状态流转
+    // 4. 调聚合根方法：状态流转
     txn.MarkAuthorized(result.ProviderRef, result.AuthCode)
 
-    // 8. 调端口：持久化 + 发布事件
+    // 5. 调端口：持久化 + 发布事件
     uc.repo.Save(ctx, txn)
 }
 ```
@@ -443,7 +432,7 @@ internal/<context>/
 ├── adapter/         被驱动适配器（实现 port 接口）
 │   ├── persistence/ 仓储实现
 │   ├── gateway/     外部系统 ACL
-│   └── <跨上下文>/   ACL 适配器（如 payment/adapter/merchant）
+│   └── <跨上下文>/   ACL 适配器（如 order/adapter/payment）
 └── handler/
     ├── http/        HTTP 驱动适配器 + 请求/响应 DTO
     └── middleware/  中间件（认证等）
@@ -504,9 +493,9 @@ internal/bootstrap/
 ├── wire_identity.go     identity 上下文组装
 ├── wire_catalog.go      catalog 上下文组装
 ├── wire_card.go         card 上下文组装
-├── wire_merchant.go     merchant 上下文组装
+├── wire_acquiring.go    acquiring 上下文组装（合并 merchant + payment）
 ├── wire_coupon.go       coupon 上下文组装
-└── wire_payment.go      payment 上下文组装（依赖其他 4 个模块）
+└── wire_order.go        order 上下文组装（依赖 catalog/coupon/acquiring）
 ```
 
 **每个上下文一个 Module struct + wire 函数：**
@@ -530,28 +519,24 @@ func wireCatalog() *CatalogModule {
 ```go
 // app.go
 func New(cfg *config.Config) *App {
-    // 0. 共享基础设施：各渠道 HTTP 客户端（Demo 使用内嵌 mock server）
-    stripeClient := stripe.NewMockClient(cfg.StripeAPIKey)
-    paypalClient := paypal.NewMockClient()
-
     // 1. 无跨上下文依赖的先组装
     identity := wireIdentity()
     catalog  := wireCatalog()
-    card     := wireCard(stripeClient)  // card 与 payment 共享 stripe.Client
-    merchant := wireMerchant()
+    card     := wireCard()
     coupon   := wireCoupon()
 
-    // 2. payment 依赖 infra 客户端 + 其他上下文的 Repository（通过 ACL adapter 隔离）
-    payment := wirePayment(
-        stripeClient, paypalClient,
-        catalog.ProductRepo, card.CardRepo,
-        merchant.MerchantRepo, coupon.CouponRepo,
-    )
+    // 2. Acquiring（合并 merchant + payment，网关客户端在内部创建）
+    acquiring := wireAcquiring(cfg, card.CardRepo, card.CardUC)
 
-    // 3. 路由注册 + 中间件链
+    // 3. Order 依赖 catalog/coupon + acquiring（通过 ACL adapter 隔离）
+    order := wireOrder(catalog.ProductRepo, coupon.CouponRepo, acquiring.ChargeUC)
+
+    // 4. 路由注册
     mux := http.NewServeMux()
     catalog.Handler.RegisterRoutes(mux)
-    // ...
+    acquiring.MerchantHandler.RegisterRoutes(mux)
+    acquiring.PaymentHandler.RegisterRoutes(mux)
+    order.Handler.RegisterRoutes(mux)
     return &App{handler: identity.Middleware.Handle(mux)}
 }
 ```
@@ -570,7 +555,7 @@ func main() {
 
 - `wire` 前缀明确表达"只做依赖组装" — 看到 `wire` 就知道函数内只有 new + 注入，无业务逻辑
 - Module struct 暴露需要跨上下文共享的依赖（如 `ProductRepo`），共享只发生在 bootstrap 包内
-- payment 的 `wirePayment` 接收其他模块的 Repository 指针作为参数，通过 ACL adapter 隔离
+- acquiring 的 `wireAcquiring` 在内部创建网关客户端和商户仓储，只接收 card 上下文的依赖
 - bootstrap 包是系统中唯一 import 所有上下文的地方 — 它仍然是 Composition Root
 
 ---
@@ -582,33 +567,31 @@ func main() {
 跨上下文通信通过 **adapter 层的 ACL（Anti-Corruption Layer）** 实现：
 
 ```
-payment 上下文                              merchant 上下文
+order 上下文                                acquiring 上下文
 ┌────────────────────┐                     ┌──────────────────┐
 │ application/       │                     │                  │
-│  ChargeUseCase     │                     │  domain/model/   │
-│                    │   ┌────────────┐    │   Merchant       │
-│  port.MerchantQuery│──▶│ adapter/   │───▶│   聚合根          │
-│  (payment 自己定义) │   │ merchant/  │    │                  │
-│                    │   │ ACL 防腐翻译│    │                  │
+│  OrderUseCase      │                     │  application/    │
+│                    │   ┌────────────┐    │   ChargeUseCase  │
+│  port.PaymentCmd   │──▶│ adapter/   │───▶│                  │
+│  (order 自己定义)   │   │ payment/   │    │  直接使用内部     │
+│                    │   │ ACL 翻译    │    │  MerchantRepo    │
 └────────────────────┘   └────────────┘    └──────────────────┘
 ```
 
-ACL 做两件事：
-1. **翻译模型** — `merchant.ChannelCredential` → `payment.ChannelCredentialView`
-2. **翻译错误** — merchant 侧的 `ErrCredentialNotFound` → payment 侧的 `ErrMerchantCredentialNotFound`
+合并后，`ChargeUseCase` 直接使用同上下文的 `MerchantRepository`（无 ACL）。
+跨上下文的 ACL 示例移至 Order → Acquiring 的调用关系。
 
 ```go
-// internal/payment/adapter/merchant/merchant_adapter.go
-func (a *MerchantAdapter) FindActiveCredential(ctx context.Context, merchantID string, channel model.PaymentMethod) (*port.ChannelCredentialView, error) {
-    m, err := a.repo.FindByID(ctx, merchantModel.MerchantID(merchantID))
-    if err != nil {
-        return nil, port.ErrMerchantCredentialNotFound  // 防腐翻译错误
-    }
-    cred, _ := m.ActiveCredential(merchantModel.PaymentChannel(channel))
-    return &port.ChannelCredentialView{                 // 防腐翻译模型
-        CredentialID: string(cred.ID),
-        Secrets:      cred.Secrets,
-    }, nil
+// internal/order/adapter/payment/payment_adapter.go
+func (a *PaymentCommandAdapter) Charge(ctx context.Context, req port.ChargeRequest) (*port.ChargeResult, error) {
+    txn, err := a.uc.Purchase(ctx, acquiringApp.PurchaseRequest{
+        MerchantID: req.MerchantID,
+        UserID:     req.UserID,
+        OrderID:    req.OrderID,
+        Amount:     req.Amount,
+        Token:      acquiringModel.CardToken{TokenID: req.CardToken},
+    })
+    return &port.ChargeResult{TransactionID: string(txn.ID), Status: string(txn.Status)}, err
 }
 ```
 
@@ -655,11 +638,11 @@ merchant := model.NewMerchant(name)
 
 ## 多商户路由
 
-Payment 上下文支持多商户隔离。核心思路：**每笔交易携带 MerchantID → 查凭据 → 动态构建该商户专属的 Gateway 实例**。
+Acquiring 上下文支持多商户隔离。核心思路：**每笔交易携带 MerchantID → 内部查 MerchantRepository → 动态构建该商户专属的 Gateway 实例**。
 
 ```
-Purchase(merchantID="m-1", ...) ──▶ MerchantQuery.FindActiveCredential("m-1", CARD)
-                                            │
+Purchase(merchantID="m-1", ...) ──▶ findActiveCredential("m-1", CARD)
+                                            │  （内部方法：MerchantRepository.FindByID → ActiveCredential）
                                             ▼ ChannelCredentialView{Secrets: {"api_key":"sk_live_xxx"}}
                                             │
                                             ▼ GatewayFactory.BuildCardGateway(cred)
@@ -680,7 +663,7 @@ cd example/payment-demo
 go run main.go
 ```
 
-### 端到端示例（Card 购买 → 扣款 → 退款）
+### 端到端示例（创建订单 → 扣款 → 退款）
 
 ```bash
 # 1. 注册商户
@@ -693,26 +676,35 @@ curl -X POST localhost:8080/merchants/credentials \
   -H "Authorization: Bearer token_alice" \
   -d '{"merchant_id":"<merchant_id>","channel":"CARD","secrets":{"api_key":"sk_live_xxx"}}'
 
-# 3. Card 购买（授权）
-curl -X POST localhost:8080/charge \
+# 3. 创建订单（查商品 + 定价 + 发起支付授权）
+curl -X POST localhost:8080/orders \
   -H "Authorization: Bearer token_alice" \
-  -d '{"merchant_id":"<merchant_id>","product_id":"gem_100","token_id":"tok_visa_4242","last4":"4242","brand":"Visa"}'
-# → {"id":"txn-xxx", "status":"AUTHORIZED", "method":"CARD", "amount":1100}
+  -d '{
+    "merchant_id": "merchant-1",
+    "product_id": "prod-gems-60",
+    "coupon_code": "SAVE10",
+    "payment_method": "CARD",
+    "token_id": "ct_xxx",
+    "last4": "4242",
+    "brand": "visa",
+    "save_card": true
+  }'
+# → {"order_id":"ord-xxx", "status":"AUTHORIZED", "product_id":"prod-gems-60",
+#    "original_amount":999, "discount_amount":100, "tax_amount":81,
+#    "final_amount":980, "currency":"USD", "transaction_id":"txn-xxx"}
 
-# 4. 扣款
-curl -X POST localhost:8080/capture \
-  -H "Authorization: Bearer token_alice" \
-  -d '{"transaction_id":"<txn_id>"}'
-# → {"status":"CAPTURED"}
+# 4. 扣款（通过订单 ID）
+curl -X POST localhost:8080/orders/<order_id>/capture \
+  -H "Authorization: Bearer token_alice"
+# → {"order_id":"ord-xxx", "status":"CAPTURED"}
 
-# 5. 退款
-curl -X POST localhost:8080/refund \
-  -H "Authorization: Bearer token_alice" \
-  -d '{"transaction_id":"<txn_id>"}'
-# → {"status":"REFUNDED"}
+# 5. 退款（通过订单 ID）
+curl -X POST localhost:8080/orders/<order_id>/refund \
+  -H "Authorization: Bearer token_alice"
+# → {"order_id":"ord-xxx", "status":"REFUNDED"}
 ```
 
-### 带优惠券的 PayPal 购买
+### 带优惠券的购买
 
 ```bash
 # 创建优惠券
@@ -720,11 +712,20 @@ curl -X POST localhost:8080/coupons \
   -H "Authorization: Bearer token_alice" \
   -d '{"code":"SAVE10","discount_type":"PERCENTAGE","discount_value":1000,"max_uses":100,"valid_from":"2024-01-01T00:00:00Z","valid_until":"2030-12-31T23:59:59Z"}'
 
-# PayPal 购买（带优惠券）
-curl -X POST localhost:8080/charge/paypal \
+# 创建订单（带优惠券）
+curl -X POST localhost:8080/orders \
   -H "Authorization: Bearer token_alice" \
-  -d '{"merchant_id":"<merchant_id>","product_id":"gem_100","order_id":"5O190127TN364715T","payer_id":"FSMVU44LF3YUS","coupon_code":"SAVE10"}'
-# → {"status":"AUTHORIZED", "method":"PAYPAL", "discount_amount":100, "tax_amount":90}
+  -d '{
+    "merchant_id": "merchant-1",
+    "product_id": "prod-gems-60",
+    "coupon_code": "SAVE10",
+    "payment_method": "CARD",
+    "token_id": "ct_xxx",
+    "last4": "4242",
+    "brand": "visa",
+    "save_card": true
+  }'
+# → {"order_id":"ord-xxx", "status":"AUTHORIZED", "discount_amount":100, "tax_amount":81, "final_amount":980}
 ```
 
 ---
@@ -740,13 +741,14 @@ curl -X POST localhost:8080/charge/paypal \
 ### Card
 | 方法 | 路径 | Body |
 |---|---|---|
-| POST | `/cards` | `{"one_time_token":"tok_xxx"}` |
+| POST | `/cards/tokenize` | `{"pan","expiry_month":1-12,"expiry_year":YYYY或YY,"cvv":3-4位数字,"cardholder_name?"}` → 临时 `ct_*`（绑卡仅在支付 Capture 成功后触发） |
 | GET | `/cards` | 我的卡列表（不含已删除） |
 | GET | `/cards?id=xxx` | 卡详情 |
 | DELETE | `/cards` | `{"card_id":"xxx"}` |
 | POST | `/cards/suspend` | `{"card_id":"xxx"}` |
 | POST | `/cards/activate` | `{"card_id":"xxx"}` |
-| PUT | `/cards/default` | `{"card_id":"xxx"}` |
+| POST/PUT | `/cards/default` | `{"card_id":"xxx"}` |
+| — | `POST /cards` | **已禁用**（禁止未经验证的直接绑卡） |
 
 ### Merchant
 | 方法 | 路径 | Body |
@@ -762,14 +764,19 @@ curl -X POST localhost:8080/charge/paypal \
 | POST | `/coupons` | `{"code","discount_type","discount_value","max_uses","valid_from","valid_until"}` |
 | GET | `/coupons?code=SAVE10` | 按编码查询 |
 
-### Payment
+### Order
 | 方法 | 路径 | Body |
 |---|---|---|
-| POST | `/charge` | `{"merchant_id","product_id","token_id"或"saved_card_id","coupon_code?"}` |
-| POST | `/charge/paypal` | `{"merchant_id","product_id","order_id","payer_id","coupon_code?"}` |
-| POST | `/capture` | `{"transaction_id":"xxx"}` |
-| POST | `/refund` | `{"transaction_id":"xxx"}` |
-| GET | `/transaction?id=xxx` | 查询交易 |
+| POST | `/orders` | `{"merchant_id","product_id","coupon_code?","payment_method","token_id"或"saved_card_id","last4?","brand?","save_card?"}`（需登录；查商品+定价+发起支付授权） |
+| POST | `/orders/{id}/capture` | —（需登录，通过订单 ID 扣款） |
+| POST | `/orders/{id}/refund` | —（需登录，通过订单 ID 退款） |
+| GET | `/orders/{id}` | 查询订单（需登录，含定价明细 + 交易状态） |
+
+### Payment（内部）
+| 方法 | 路径 | Body |
+|---|---|---|
+| GET | `/internal/transaction?id=xxx` | 查询交易（内部端点，不对外暴露） |
+| POST | `/webhooks/recurring-token` | `{"provider_ref","channel?","recurring_token"}`；若配置 `RECURRING_WEBHOOK_SECRET` 则须请求头 `X-Webhook-Secret` |
 
 ---
 
@@ -815,9 +822,8 @@ var _ port.CardRepository = (*testRepo)(nil)
 
 | 需求 | 改动位置 | 不影响 |
 |---|---|---|
-| 接入真实 Stripe/PayPal | `infra/stripe`、`infra/paypal` 切换 `NewClient` 替代 `NewMockClient`，adapter 零改动 | domain, application, handler |
+| 接入真实 Stripe/PayPal | `acquiring/adapter/gateway/stripe`、`paypal` 切换 `NewClient` 替代 `NewMockClient` | domain, application, handler |
 | 换 PostgreSQL 持久化 | 新增 `adapter/persistence/pg_repo.go`，实现同一 port 接口 | domain, application, handler |
 | 加 gRPC 入口 | 新增 `handler/grpc/` | domain, application, adapter |
-| 新增支付渠道（Apple Pay） | merchant 加枚举 + payment 加 Gateway 端口 + adapter | 其他上下文 |
-| 接入真实商品服务 | 新增 `payment/adapter/catalog/api_catalog.go` | domain, application, handler |
+| 新增支付渠道（Apple Pay） | acquiring 加 `PaymentMethod` 枚举 + Gateway 端口 + adapter | 其他上下文 |
 | 新增限界上下文 | 新建 `internal/<context>/` 完整分层 + bootstrap 新增 `wire_<context>.go` | 已有上下文 |

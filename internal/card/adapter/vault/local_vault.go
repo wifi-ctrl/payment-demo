@@ -43,6 +43,23 @@ func (v *LocalVault) CacheTokenizedCard(_ context.Context, data port.CachedCardD
 	return token, nil
 }
 
+func (v *LocalVault) PeekCachedCard(_ context.Context, cardToken, userID string) (*port.CachedCardData, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	entry, ok := v.cache[cardToken]
+	if !ok {
+		return nil, model.ErrCardTokenInvalid
+	}
+	if time.Now().After(entry.expiresAt) {
+		return nil, model.ErrCardTokenExpired
+	}
+	if entry.data.UserID != userID {
+		return nil, model.ErrCardBelongsToOtherUser
+	}
+	cp := entry.data
+	return &cp, nil
+}
+
 func (v *LocalVault) ConsumeCardToken(_ context.Context, cardToken string) (*port.CachedCardData, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()

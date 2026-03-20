@@ -3,12 +3,12 @@ package http
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"time"
 
 	"payment-demo/internal/coupon/application"
 	"payment-demo/internal/coupon/domain/model"
+	"payment-demo/internal/shared/httputil"
 )
 
 // CouponHandler HTTP 驱动适配器。
@@ -67,7 +67,7 @@ func (h *CouponHandler) handleCoupons(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		h.handleGetCoupon(w, r)
 	default:
-		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		httputil.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -75,27 +75,27 @@ func (h *CouponHandler) handleCoupons(w http.ResponseWriter, r *http.Request) {
 func (h *CouponHandler) handleCreateCoupon(w http.ResponseWriter, r *http.Request) {
 	var req CreateCouponRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, "invalid request body", http.StatusBadRequest)
+		httputil.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
 	if req.Code == "" {
-		jsonError(w, "code is required", http.StatusBadRequest)
+		httputil.Error(w, "code is required", http.StatusBadRequest)
 		return
 	}
 	if req.DiscountType == "" {
-		jsonError(w, "discount_type is required", http.StatusBadRequest)
+		httputil.Error(w, "discount_type is required", http.StatusBadRequest)
 		return
 	}
 
 	validFrom, err := time.Parse(time.RFC3339, req.ValidFrom)
 	if err != nil {
-		jsonError(w, "valid_from must be RFC3339 format", http.StatusBadRequest)
+		httputil.Error(w, "valid_from must be RFC3339 format", http.StatusBadRequest)
 		return
 	}
 	validUntil, err := time.Parse(time.RFC3339, req.ValidUntil)
 	if err != nil {
-		jsonError(w, "valid_until must be RFC3339 format", http.StatusBadRequest)
+		httputil.Error(w, "valid_until must be RFC3339 format", http.StatusBadRequest)
 		return
 	}
 
@@ -108,32 +108,28 @@ func (h *CouponHandler) handleCreateCoupon(w http.ResponseWriter, r *http.Reques
 		ValidUntil:    validUntil,
 	})
 	if err != nil {
-		jsonError(w, err.Error(), mapErrorStatus(err))
+		httputil.UseCaseError(w, err, mapErrorStatus)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(toResponse(coupon)); err != nil {
-		log.Printf("[CouponHandler] encode error: %v", err)
-	}
+	httputil.Created(w, toResponse(coupon))
 }
 
 // handleGetCoupon GET /coupons?code=SAVE10 — 按编码查询优惠券
 func (h *CouponHandler) handleGetCoupon(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		jsonError(w, "code query parameter is required", http.StatusBadRequest)
+		httputil.Error(w, "code query parameter is required", http.StatusBadRequest)
 		return
 	}
 
 	coupon, err := h.useCase.GetCouponByCode(r.Context(), code)
 	if err != nil {
-		jsonError(w, err.Error(), mapErrorStatus(err))
+		httputil.UseCaseError(w, err, mapErrorStatus)
 		return
 	}
 
-	jsonOK(w, toResponse(coupon))
+	httputil.OK(w, toResponse(coupon))
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -165,20 +161,5 @@ func mapErrorStatus(err error) int {
 		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError
-	}
-}
-
-func jsonOK(w http.ResponseWriter, data any) {
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Printf("[CouponHandler] jsonOK encode error: %v", err)
-	}
-}
-
-func jsonError(w http.ResponseWriter, msg string, status int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(map[string]string{"error": msg}); err != nil {
-		log.Printf("[CouponHandler] jsonError encode error: %v", err)
 	}
 }

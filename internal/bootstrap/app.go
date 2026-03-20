@@ -9,9 +9,7 @@ package bootstrap
 import (
 	"net/http"
 
-	"payment-demo/internal/infra/config"
-	"payment-demo/internal/infra/paypal"
-	"payment-demo/internal/infra/stripe"
+	"payment-demo/internal/config"
 )
 
 // App 应用实例，持有组装完毕的 HTTP handler。
@@ -21,37 +19,31 @@ type App struct {
 
 // New 组装所有上下文并返回可运行的 App。
 func New(cfg *config.Config) *App {
-	// 0. 共享基础设施：各渠道 HTTP 客户端（Demo 使用内嵌 mock server）
-	stripeClient := stripe.NewMockClient(cfg.StripeAPIKey) // Card 渠道（card + payment 共用）
-	paypalClient := paypal.NewMockClient()                 // PayPal 渠道（payment 使用）
-
-	// 1. 各上下文独立组装（无跨上下文依赖的先组装）
+	// 1. 独立上下文
 	identity := wireIdentity()
 	catalog := wireCatalog()
 	card := wireCard()
-	merchant := wireMerchant()
 	coupon := wireCoupon()
 
-	// 2. payment 依赖其他上下文的 Repository（通过 ACL adapter 隔离）
-	payment := wirePayment(
-		stripeClient,
-		paypalClient,
+	// 2. Acquiring 合并了 merchant + payment，依赖 card
+	acquiring := wireAcquiring(cfg, card.CardRepo, card.CardUC)
+
+	// 3. Order 依赖 catalog + coupon + Acquiring.ChargeUseCase
+	order := wireOrder(
 		catalog.ProductRepo,
-		card.CardRepo,
-		card.CardUC,
-		merchant.MerchantRepo,
 		coupon.CouponRepo,
+		acquiring.ChargeUC,
 	)
 
-	// 3. 路由注册
+	// 4. 路由注册
 	mux := http.NewServeMux()
 	catalog.Handler.RegisterRoutes(mux)
 	card.Handler.RegisterRoutes(mux)
-	merchant.Handler.RegisterRoutes(mux)
+	acquiring.MerchantHandler.RegisterRoutes(mux)
 	coupon.Handler.RegisterRoutes(mux)
-	payment.Handler.RegisterRoutes(mux)
+	acquiring.PaymentHandler.RegisterRoutes(mux)
+	order.Handler.RegisterRoutes(mux)
 
-	// 4. 中间件链
 	return &App{handler: identity.Middleware.Handle(mux)}
 }
 

@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"fmt"
 	"log"
 
 	"payment-demo/internal/card/domain/port"
@@ -24,12 +25,18 @@ func NewKeyRotationUseCase(
 }
 
 // RotateAndMigrate 轮换 DEK 并迁移旧版本加密的卡数据。
+// PCI Req 7/8: operatorID 标识执行者，不可为空，确保审计可追溯。
 //
 //	1. RotateDEK → 生成新 DEK 版本
 //	2. 查所有使用旧版本加密的卡
 //	3. 逐卡：DecryptPAN(old) → EncryptPAN(new) → ReEncrypt → Save
 //	4. 迁移完成 → RetireDEK(old)
-func (uc *KeyRotationUseCase) RotateAndMigrate(ctx context.Context) error {
+func (uc *KeyRotationUseCase) RotateAndMigrate(ctx context.Context, operatorID string) error {
+	if operatorID == "" {
+		return fmt.Errorf("key rotation requires operator identity (PCI Req 8)")
+	}
+	log.Printf("[KeyRotation] Initiated by operator=%s", operatorID)
+
 	versions, err := uc.keyMgr.ListVersions()
 	if err != nil {
 		return err

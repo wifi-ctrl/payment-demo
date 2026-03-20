@@ -34,6 +34,18 @@ func (v *testVault) CacheTokenizedCard(_ context.Context, data port.CachedCardDa
 	return token, nil
 }
 
+func (v *testVault) PeekCachedCard(_ context.Context, cardToken, userID string) (*port.CachedCardData, error) {
+	data, ok := v.cached[cardToken]
+	if !ok {
+		return nil, model.ErrCardTokenInvalid
+	}
+	if data.UserID != userID {
+		return nil, model.ErrCardBelongsToOtherUser
+	}
+	cp := data
+	return &cp, nil
+}
+
 func (v *testVault) ConsumeCardToken(_ context.Context, token string) (*port.CachedCardData, error) {
 	data, ok := v.cached[token]
 	if !ok {
@@ -205,52 +217,16 @@ func newTestSavedCard(userID string) *model.SavedCard {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// POST /cards 绑卡成功 → 201 + card_id
+// POST /cards → 405（绑卡只在支付成功后内部触发，不暴露 HTTP 端点）
 // ─────────────────────────────────────────────────────────────────
 
-func TestCardHandler_BindCard_Success_Returns201(t *testing.T) {
-	repo := newTestRepo()
-	handler := setup(repo, successVault(), "user-1")
-
-	w := doRequest(handler, http.MethodPost, "/cards", jsonBody(map[string]string{
-		"one_time_token": "ct_test_token",
-	}))
-
-	if w.Code != http.StatusCreated {
-		t.Errorf("want 201, got %d (body: %s)", w.Code, w.Body.String())
-	}
-	var resp map[string]interface{}
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if resp["card_id"] == "" || resp["card_id"] == nil {
-		t.Errorf("want non-empty 'card_id' in response, got: %v", resp)
-	}
-}
-
-// POST /cards 无 userID → 401
-func TestCardHandler_BindCard_NoAuth_Returns401(t *testing.T) {
-	handler := setupNoAuth(newTestRepo(), successVault())
-
-	w := doRequest(handler, http.MethodPost, "/cards", jsonBody(map[string]string{
-		"one_time_token": "ct_test_token",
-	}))
-
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("want 401, got %d", w.Code)
-	}
-}
-
-// POST /cards body 为空 → 400
-func TestCardHandler_BindCard_EmptyToken_Returns400(t *testing.T) {
+func TestCardHandler_PostCards_Returns405(t *testing.T) {
 	handler := setup(newTestRepo(), successVault(), "user-1")
-
 	w := doRequest(handler, http.MethodPost, "/cards", jsonBody(map[string]string{
-		"one_time_token": "",
+		"one_time_token": "ct_test_token",
 	}))
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("want 400, got %d", w.Code)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("want 405, got %d (body: %s)", w.Code, w.Body.String())
 	}
 }
 
@@ -521,9 +497,10 @@ func TestCardHandler_GetCard_NotFound_Returns404(t *testing.T) {
 
 func TestCardHandler_MethodNotAllowed_OnCards(t *testing.T) {
 	handler := setup(newTestRepo(), successVault(), "user-1")
-	w := doRequest(handler, http.MethodPatch, "/cards", nil)
-
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("want 405, got %d", w.Code)
+	for _, method := range []string{http.MethodPatch, http.MethodPut} {
+		w := doRequest(handler, method, "/cards", nil)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s /cards: want 405, got %d", method, w.Code)
+		}
 	}
 }

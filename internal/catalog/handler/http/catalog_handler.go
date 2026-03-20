@@ -1,11 +1,11 @@
 package http
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"payment-demo/internal/catalog/application"
 	"payment-demo/internal/catalog/domain/model"
+	"payment-demo/internal/shared/httputil"
 )
 
 // CatalogHandler HTTP 驱动适配器
@@ -39,23 +39,23 @@ func (h *CatalogHandler) handleProducts(w http.ResponseWriter, r *http.Request) 
 	if id != "" {
 		product, err := h.useCase.GetProduct(r.Context(), model.ProductID(id))
 		if err != nil {
-			jsonError(w, err.Error(), http.StatusNotFound)
+			httputil.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		jsonOK(w, toProductResponse(product))
+		httputil.OK(w, toProductResponse(product))
 		return
 	}
 
 	products, err := h.useCase.ListProducts(r.Context())
 	if err != nil {
-		jsonError(w, err.Error(), http.StatusInternalServerError)
+		httputil.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	resp := make([]ProductResponse, 0, len(products))
 	for _, p := range products {
 		resp = append(resp, toProductResponse(p))
 	}
-	jsonOK(w, resp)
+	httputil.OK(w, resp)
 }
 
 func toProductResponse(p *model.Product) ProductResponse {
@@ -66,15 +66,4 @@ func toProductResponse(p *model.Product) ProductResponse {
 		Currency: p.Price.Currency,
 		Status:   string(p.Status),
 	}
-}
-
-func jsonOK(w http.ResponseWriter, data any) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
-}
-
-func jsonError(w http.ResponseWriter, msg string, status int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }

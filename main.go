@@ -5,7 +5,7 @@ import (
 	"net/http"
 
 	"payment-demo/internal/bootstrap"
-	"payment-demo/internal/infra/config"
+	"payment-demo/internal/config"
 )
 
 func main() {
@@ -31,13 +31,16 @@ func printRoutes() {
 	log.Println("    GET  /products?id=xxx       - 商品详情")
 	log.Println("")
 	log.Println("  Card:")
-	log.Println("    POST   /cards               - 绑卡")
-	log.Println("    POST   /cards/tokenize      - 卡令牌化（PAN → ct_token）")
+	log.Println("    POST   /cards/tokenize      - 卡令牌化（PAN → 临时 ct_token；绑卡仅在支付 Capture 成功后由系统触发）")
 	log.Println("    GET    /cards               - 我的卡列表")
 	log.Println("    GET    /cards?id=xxx        - 卡详情")
 	log.Println("    DELETE /cards               - 删除卡")
+	log.Println("    POST   /cards/suspend        - 暂停卡")
+	log.Println("    POST   /cards/activate      - 激活卡")
+	log.Println("    POST   /cards/default       - 设为默认卡（亦支持 PUT）")
+	log.Println("    (POST /cards 已禁用 — 禁止未经验证的直接绑卡)")
 	log.Println("")
-	log.Println("  Merchant:")
+	log.Println("  Acquiring (Merchant):")
 	log.Println("    POST   /merchants                    - 注册商户")
 	log.Println("    GET    /merchants                    - 商户列表")
 	log.Println("    POST   /merchants/credentials        - 添加渠道凭据")
@@ -47,10 +50,13 @@ func printRoutes() {
 	log.Println("    POST /coupons               - 创建优惠券")
 	log.Println("    GET  /coupons?code=SAVE10   - 按编码查询优惠券")
 	log.Println("")
-	log.Println("  Payment:")
-	log.Println("    POST /charge                - Card 购买")
-	log.Println("    POST /charge/paypal         - PayPal 购买")
-	log.Println("    POST /capture               - 扣款")
-	log.Println("    POST /refund                - 退款")
-	log.Println("    GET  /transaction?id=xxx    - 查询交易")
+	log.Println("  Order:")
+	log.Println("    POST /orders                - 创建订单（查商品+定价+发起支付授权）")
+	log.Println("    POST /orders/{id}/capture   - 扣款（通过订单 ID）")
+	log.Println("    POST /orders/{id}/refund    - 退款（通过订单 ID）")
+	log.Println("    GET  /orders/{id}           - 查询订单")
+	log.Println("")
+	log.Println("  Acquiring (Payment — internal):")
+	log.Println("    GET  /internal/transaction?id=xxx - 查询交易（内部端点）")
+	log.Println("    POST /webhooks/recurring-token    - 异步 recurring token（若设置 RECURRING_WEBHOOK_SECRET 则需 X-Webhook-Secret 头）")
 }

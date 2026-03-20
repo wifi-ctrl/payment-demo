@@ -1,12 +1,12 @@
 package middleware
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 
 	"payment-demo/internal/identity/application"
 	"payment-demo/internal/shared/auth"
+	"payment-demo/internal/shared/httputil"
 )
 
 // UserIDFromContext 从 context 中取出认证后的用户 ID。
@@ -27,13 +27,13 @@ func (m *AuthMiddleware) Handle(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if token == "" {
-			jsonError(w, "missing authorization token", http.StatusUnauthorized)
+			httputil.Error(w, "missing authorization token", http.StatusUnauthorized)
 			return
 		}
 
 		user, err := m.authUseCase.Authenticate(r.Context(), token)
 		if err != nil {
-			jsonError(w, err.Error(), http.StatusUnauthorized)
+			httputil.Error(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
 
@@ -41,10 +41,4 @@ func (m *AuthMiddleware) Handle(next http.Handler) http.Handler {
 		ctx := auth.WithUserID(r.Context(), string(user.ID))
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
-}
-
-func jsonError(w http.ResponseWriter, msg string, status int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }

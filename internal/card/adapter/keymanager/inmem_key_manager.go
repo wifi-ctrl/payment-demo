@@ -77,7 +77,11 @@ func (m *InMemKeyManager) RetireDEK(version int) error {
 	if !ok {
 		return fmt.Errorf("DEK version %d not found", version)
 	}
-	entry.status = "retired"
+	// PCI Req 3: 退役密钥清零后从内存删除，防止泄漏
+	for i := range entry.dek {
+		entry.dek[i] = 0
+	}
+	delete(m.deks, version)
 	return nil
 }
 

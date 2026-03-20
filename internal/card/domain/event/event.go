@@ -3,6 +3,7 @@
 package event
 
 import (
+	"fmt"
 	"time"
 
 	sharedEvent "payment-demo/internal/shared/event"
@@ -86,3 +87,8 @@ type PANDecrypted struct {
 }
 
 func (e PANDecrypted) EventName() string { return "card.pan_decrypted" }
+
+// String PCI Req 10: 审计日志安全格式，防止 %+v 泄漏未来可能新增的敏感字段
+func (e PANDecrypted) String() string {
+	return fmt.Sprintf("{CardID:%s UserID:%s Reason:%s At:%s}", e.CardID, e.UserID, e.Reason, e.OccurredAt.Format(time.RFC3339))
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"payment-demo/internal/card/adapter/vault"
 	"payment-demo/internal/card/application"
 	"payment-demo/internal/card/domain/model"
 	"payment-demo/internal/card/domain/port"
@@ -34,6 +35,18 @@ func (v *stubVault) CacheTokenizedCard(_ context.Context, data port.CachedCardDa
 	v.lastToken = token
 	v.cached[token] = data
 	return token, nil
+}
+
+func (v *stubVault) PeekCachedCard(_ context.Context, cardToken, userID string) (*port.CachedCardData, error) {
+	data, ok := v.cached[cardToken]
+	if !ok {
+		return nil, model.ErrCardTokenInvalid
+	}
+	if data.UserID != userID {
+		return nil, model.ErrCardBelongsToOtherUser
+	}
+	cp := data
+	return &cp, nil
 }
 
 func (v *stubVault) ConsumeCardToken(_ context.Context, token string) (*port.CachedCardData, error) {
@@ -344,5 +357,47 @@ func TestCardUseCase_GetCard_OtherUser_ReturnsForbidden(t *testing.T) {
 	_, err := uc.GetCard(context.Background(), "user-1", card.ID)
 	if !errors.Is(err, model.ErrCardBelongsToOtherUser) {
 		t.Errorf("want ErrCardBelongsToOtherUser, got %v", err)
+	}
+}
+
+func TestCardUseCase_ResolveCardForGateway_AfterTokenize_CreatesSeparateGatewayToken(t *testing.T) {
+	ctx := context.Background()
+	repo := newStubRepo()
+	v := vault.NewLocalVault()
+	uc := application.NewCardUseCase(repo, v, stubEncryption())
+
+	tokRes, err := uc.Tokenize(ctx, application.TokenizeRequest{
+		UserID:         "u1",
+		PAN:            "4242424242424242",
+		ExpiryMonth:    12,
+		ExpiryYear:     2030,
+		CVV:            "123",
+		CardholderName: "Test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokRes.CardToken == nil {
+		t.Fatal("want CardToken from tokenize")
+	}
+	orig := *tokRes.CardToken
+
+	gw, err := uc.ResolveCardForGateway(ctx, orig, "u1")
+	if err != nil {
+		t.Fatalf("ResolveCardForGateway: %v", err)
+	}
+	if gw.GatewayToken == orig {
+		t.Fatal("gateway token should differ from original ct_")
+	}
+	if gw.Last4 != "4242" {
+		t.Errorf("Last4: want 4242, got %q", gw.Last4)
+	}
+	peekOrig, err := v.PeekCachedCard(ctx, orig, "u1")
+	if err != nil || len(peekOrig.EncryptedPAN.Ciphertext) == 0 {
+		t.Fatalf("original ct_ should remain with ciphertext: err=%v", err)
+	}
+	gwPeek, err := v.PeekCachedCard(ctx, gw.GatewayToken, "u1")
+	if err != nil || gwPeek.RawPAN != "4242424242424242" {
+		t.Fatalf("gateway ct_ should hold RawPAN: err=%v pan=%q", err, gwPeek.RawPAN)
 	}
 }

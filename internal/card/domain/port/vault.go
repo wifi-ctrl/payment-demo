@@ -29,6 +29,9 @@ type CardVault interface {
 	// CacheTokenizedCard 将加密后的卡数据临时缓存，返回 card_token
 	CacheTokenizedCard(ctx context.Context, data CachedCardData) (cardToken string, err error)
 
+	// PeekCachedCard 校验临时 token 存在、未过期且归属指定用户，并返回缓存数据（不消费 token）
+	PeekCachedCard(ctx context.Context, cardToken, userID string) (*CachedCardData, error)
+
 	// ConsumeCardToken 原子取出并删除临时卡数据（GETDEL 语义）
 	ConsumeCardToken(ctx context.Context, cardToken string) (*CachedCardData, error)
 }
